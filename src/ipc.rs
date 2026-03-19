@@ -1,0 +1,421 @@
+pub mod client {
+    use anyhow::{Context, Result, anyhow};
+    use bytes::Bytes;
+    use http::{Method, Request, StatusCode};
+    use http_body_util::{BodyExt, Full};
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Value, json};
+    use tokio::net::UnixStream;
+    use uuid::Uuid;
+
+    #[derive(Debug, Deserialize, Serialize, Clone)]
+    pub struct ClientSendResult {
+        pub server: String,
+        pub sent: bool,
+        #[serde(default)]
+        pub subspace_message_id: Option<String>,
+        #[serde(default)]
+        pub idempotency_key: Option<String>,
+        #[serde(default)]
+        pub error: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, Clone)]
+    pub struct ClientResponse {
+        pub ok: bool,
+        #[serde(default)]
+        pub results: Vec<ClientSendResult>,
+        #[serde(default)]
+        pub error: Option<Value>,
+    }
+
+    pub async fn send_via_socket(
+        socket_path: &std::path::Path,
+        text: &str,
+        idempotency_key: Option<&str>,
+        server: Option<&str>,
+    ) -> Result<ClientResponse> {
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .with_context(|| format!("failed connecting to {}", socket_path.display()))?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = http1::handshake(io).await?;
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                tracing::debug!(error = %err, "ipc client connection ended");
+            }
+        });
+
+        let body = json!({
+            "text": text,
+            "server": server,
+            "idempotency_key": idempotency_key.map(ToOwned::to_owned).unwrap_or_else(|| Uuid::new_v4().to_string()),
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/v1/messages")
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(serde_json::to_vec(&body)?)))?;
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let body = response.into_body().collect().await?.to_bytes();
+        let parsed: ClientResponse = serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "failed parsing daemon response: {}",
+                String::from_utf8_lossy(&body)
+            )
+        })?;
+        if status != StatusCode::OK {
+            return Err(anyhow!(
+                "daemon returned {}: {}",
+                status,
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        Ok(parsed)
+    }
+}
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Result;
+use bytes::Bytes;
+use http::{Method, Request, Response, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
+use tokio::net::UnixListener;
+use tokio::sync::{RwLock, broadcast};
+use tracing::{error, info, warn};
+
+use crate::config::canonicalize_base_url;
+use crate::subspace::client::ServerHandle;
+use crate::supervisor::{DaemonStatus, ServerSendResultEnvelope};
+
+#[derive(Debug, Deserialize)]
+struct SendRequest {
+    text: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    server: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody<'a> {
+    ok: bool,
+    error: ErrorShape<'a>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    results: Vec<ServerSendResultEnvelope>,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorShape<'a> {
+    code: &'a str,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthBody {
+    ok: bool,
+    gateway_state: String,
+    wake_session_key: String,
+    servers: Vec<crate::supervisor::ServerHealth>,
+}
+
+#[derive(Debug, Serialize)]
+struct SendBody {
+    ok: bool,
+    results: Vec<ServerSendResultEnvelope>,
+}
+
+#[derive(Clone)]
+pub struct SendRouter {
+    status: Arc<RwLock<DaemonStatus>>,
+    handles: BTreeMap<String, ServerHandle>,
+}
+
+impl SendRouter {
+    pub fn new(status: Arc<RwLock<DaemonStatus>>, handles: BTreeMap<String, ServerHandle>) -> Self {
+        Self { status, handles }
+    }
+
+    pub async fn send(
+        &self,
+        text: String,
+        idempotency_key: Option<String>,
+        server: Option<String>,
+    ) -> std::result::Result<Vec<ServerSendResultEnvelope>, SendRouteError> {
+        let snapshot = self.status.read().await.clone();
+        let targets = match server {
+            Some(server) => {
+                let canonical = canonicalize_base_url(&server).map_err(|err| {
+                    SendRouteError::invalid_request(format!("invalid server url: {err}"))
+                })?;
+                if !self.handles.contains_key(&canonical) {
+                    return Err(SendRouteError::unknown_server());
+                }
+                vec![canonical]
+            }
+            None => snapshot
+                .servers_snapshot()
+                .into_iter()
+                .filter(|server| server.subspace_state == "live")
+                .map(|server| server.server)
+                .collect(),
+        };
+
+        if targets.is_empty() {
+            return Err(SendRouteError::subspace_unavailable(
+                "no targeted Subspace server is live".to_string(),
+            ));
+        }
+
+        if let Some(non_live) = targets
+            .iter()
+            .find(|target| snapshot.server_state(target) != Some("live".to_string()))
+        {
+            return Err(SendRouteError::subspace_unavailable(format!(
+                "targeted Subspace server is not live: {non_live}"
+            )));
+        }
+
+        let mut results = Vec::with_capacity(targets.len());
+        for target in targets {
+            let handle = self
+                .handles
+                .get(&target)
+                .ok_or_else(|| SendRouteError::unknown_server())?;
+            match handle
+                .send_message(text.clone(), idempotency_key.clone())
+                .await
+            {
+                Ok(result) => results.push(ServerSendResultEnvelope {
+                    server: result.server,
+                    sent: true,
+                    subspace_message_id: result.subspace_message_id,
+                    idempotency_key: Some(result.idempotency_key),
+                    error: None,
+                }),
+                Err(err) => results.push(ServerSendResultEnvelope {
+                    server: target,
+                    sent: false,
+                    subspace_message_id: None,
+                    idempotency_key: idempotency_key.clone(),
+                    error: Some(err.to_string()),
+                }),
+            }
+        }
+
+        if results.iter().all(|result| result.sent) {
+            Ok(results)
+        } else {
+            Err(SendRouteError::mixed_failure(results))
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SendRouteError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    results: Vec<ServerSendResultEnvelope>,
+}
+
+impl SendRouteError {
+    fn invalid_request(message: String) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_request",
+            message,
+            results: Vec::new(),
+        }
+    }
+
+    fn unknown_server() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "unknown_server",
+            message: "server not configured".to_string(),
+            results: Vec::new(),
+        }
+    }
+
+    fn subspace_unavailable(message: String) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "subspace_unavailable",
+            message,
+            results: Vec::new(),
+        }
+    }
+
+    fn mixed_failure(results: Vec<ServerSendResultEnvelope>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "subspace_unavailable",
+            message: "one or more targeted Subspace servers failed".to_string(),
+            results,
+        }
+    }
+}
+
+pub async fn run_ipc_server(
+    socket_path: PathBuf,
+    status: Arc<RwLock<DaemonStatus>>,
+    send_router: SendRouter,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<()> {
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(&socket_path).await;
+    }
+    let listener = UnixListener::bind(&socket_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&socket_path, perms)?;
+    }
+    info!(component = "ipc", socket = %socket_path.display(), event = "ipc_listening", "unix socket listening");
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let io = TokioIo::new(stream);
+                let status = status.clone();
+                let send_router = send_router.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| handle_request(req, status.clone(), send_router.clone()));
+                    if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                        error!(component = "ipc", error = %err, event = "ipc_connection_failed", "ipc connection failed");
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_request(
+    req: Request<Incoming>,
+    status: Arc<RwLock<DaemonStatus>>,
+    send_router: SendRouter,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let response = match (req.method(), req.uri().path()) {
+        (&Method::GET, "/healthz") => {
+            let snapshot = status.read().await.clone();
+            json_response(
+                StatusCode::OK,
+                &HealthBody {
+                    ok: snapshot.is_healthy(),
+                    gateway_state: snapshot.gateway_state.clone(),
+                    wake_session_key: snapshot.wake_session_key.clone(),
+                    servers: snapshot.servers_snapshot(),
+                },
+            )
+        }
+        (&Method::POST, "/v1/messages") => {
+            let body_bytes = req.into_body().collect().await?.to_bytes();
+            let payload: SendRequest = match serde_json::from_slice(&body_bytes) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        component = "ipc",
+                        event = "ipc_outbound_rejected",
+                        error = %err,
+                        "invalid outbound request json"
+                    );
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        format!("invalid json: {err}"),
+                        Vec::new(),
+                    ));
+                }
+            };
+            if payload.text.trim().is_empty() {
+                warn!(
+                    component = "ipc",
+                    event = "ipc_outbound_rejected",
+                    reason = "text required",
+                    "invalid outbound request"
+                );
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "text required".to_string(),
+                    Vec::new(),
+                ));
+            }
+            match send_router
+                .send(payload.text, payload.idempotency_key, payload.server)
+                .await
+            {
+                Ok(results) => {
+                    info!(
+                        component = "ipc",
+                        event = "ipc_outbound_sent",
+                        targets = results.len(),
+                        "outbound subspace message sent"
+                    );
+                    json_response(StatusCode::OK, &SendBody { ok: true, results })
+                }
+                Err(err) => {
+                    warn!(
+                        component = "ipc",
+                        event = "ipc_outbound_rejected",
+                        error = %err.message,
+                        code = err.code,
+                        "subspace outbound send rejected"
+                    );
+                    error_response(err.status, err.code, err.message, err.results)
+                }
+            }
+        }
+        _ => error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "not found".to_string(),
+            Vec::new(),
+        ),
+    };
+    Ok(response)
+}
+
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
+    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+fn error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    results: Vec<ServerSendResultEnvelope>,
+) -> Response<Full<Bytes>> {
+    json_response(
+        status,
+        &ErrorBody {
+            ok: false,
+            error: ErrorShape { code, message },
+            results,
+        },
+    )
+}

@@ -1,0 +1,8 @@
+target/
+scratch/
+.DS_Store
+*.log
+*.tmp
+subspace-session.json
+runtime.json
+device-auth.json
