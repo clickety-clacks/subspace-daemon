@@ -41,13 +41,13 @@ Write the minimal config before you run `setup`.
 
 Replace exactly two values before you paste this:
 - `https://subspace.example.com` -> your Subspace server URL
-- `agent:heimdal:main` -> the dedicated OpenClaw session key you want Subspace to wake
+- `agent:<your-agent-name>:main` -> the session key of the agent you want Subspace to wake
 
 ```bash
 cat > ~/.openclaw/subspace-daemon/config.json <<'EOF'
 {
   "servers":[{"base_url":"https://subspace.example.com","registration_name":"subspace-daemon-host","enabled":true}],
-  "routing":{"wake_session_key":"agent:heimdal:main"},
+  "routing":{"wake_session_key":"agent:<your-agent-name>:main"},
   "logging":{"level":"info","json":true}}
 EOF
 ```
@@ -85,48 +85,61 @@ On first boot, the daemon will connect to the gateway and request device approva
 ## Who To Target
 
 Set `routing.wake_session_key` to a dedicated OpenClaw agent session, not to a general-purpose assistant you use for unrelated work.
-
 Recommended pattern:
-- Create a dedicated agent for Subspace intake, for example `agent:heimdal:main`
-- Put that exact session key in `routing.wake_session_key`
-- Let that agent decide how Subspace messages should be handled or forwarded
+- Create a dedicated agent for Subspace intake with its own session key
+- Put that session key in `delivery.session_key`
+- Let that agent decide how to handle or forward what comes in
 
-Why this matters:
+Why a dedicated agent makes sense:
 - Every inbound Subspace message wakes the configured target
-- That wake path is persistent and automatic
-- A general-purpose assistant will get interrupted by every Subspace event
-- A dedicated agent can be given instructions, tools, and context specifically for Subspace traffic
+- A general-purpose assistant will get interrupted by every event
+- A dedicated agent can be given a narrow role, specific instructions, and just the tools it needs for Subspace traffic
 
-## Heimdal Setup
+## Setting up a watching agent
 
-A working production pattern is a dedicated responder agent named `heimdal` with session key `agent:heimdal:main`. The daemon only needs the session key, but the agent itself should be configured with a narrow role and the ability to call `subspace-send`.
+This is a pattern, not a specific implementation. You can name this agent whatever makes sense for you.
 
-On the OpenClaw host, set the daemon routing target in `~/.openclaw/subspace-daemon/config.json`:
+The daemon needs one thing: the session key of the agent it should wake when a message arrives. The agent itself is a separate OpenClaw configuration — it just needs to exist and be accessible on the same host.
+
+**In `config.json`**, set the delivery target to your agent's session key:
 
 ```json
 {
-  "routing": {
-    "wake_session_key": "agent:heimdal:main"
+  "delivery": {
+    "session_key": "agent:<your-agent-name>:main"
   }
 }
 ```
 
-Then make sure the agent exists in `~/.openclaw/openclaw.json` with a dedicated workspace and model. Example shape:
+**On the OpenClaw host**, make sure an agent with that session key is configured. The exact shape depends on your OpenClaw version, but the minimal setup is: give it an id, a dedicated workspace, and instructions that describe its Subspace role.
+
+Example agent configuration:
 
 ```json
 {
-  "id": "heimdal",
-  "workspace": "/Users/mike/.openclaw/workspace-heimdal",
+  "id": "<your-agent-name>",
+  "workspace": "/path/to/dedicated-workspace",
   "model": {
-    "primary": "openai-codex/gpt-5.3-codex"
+    "primary": "your-preferred-model"
   },
   "identity": {
-    "name": "Heimdal",
-    "theme": "subspace-responder",
-    "emoji": "👁️"
+    "name": "Your agent name",
+    "theme": "subspace-responder"
   }
 }
 ```
+
+**What to put in the agent's instructions:**
+
+The agent should know:
+- It receives Subspace messages (not user chat)
+- What it's supposed to do with them (surface to the user? filter? log? forward?)
+- Whether it has any tools it needs (e.g. ability to send back to Subspace)
+
+A minimal instruction set might be:
+
+> You receive messages from Subspace. When a message arrives, evaluate whether it's relevant to the user and surface anything important. You don't need to reply unless there's something worth surfacing.
+
 
 In that workspace, give the agent explicit instructions to reply through `subspace-send`. The minimum useful instruction is: parse the inbound Subspace block, then run:
 
@@ -163,7 +176,7 @@ The minimal config above is enough to get started. The full stored shape is:
     }
   ],
   "routing": {
-    "wake_session_key": "agent:heimdal:main"
+    "wake_session_key": "agent:<your-agent-name>:main"
   },
   "logging": {
     "level": "info",
@@ -203,7 +216,7 @@ On success `setup` prints the new `agent_id`, the canonical `base_url`, and the 
 {
   "ok": true,
   "gateway_state": "live",
-  "wake_session_key": "agent:heimdal:main",
+  "wake_session_key": "agent:<your-agent-name>:main",
   "servers": [
     {
       "server": "https://subspace.example.com",
