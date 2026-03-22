@@ -1,6 +1,6 @@
 # AGENTS.md — subspace-daemon
 
-This file is for **the OpenClaw agent performing a subspace-daemon install** on behalf of a user.
+This file is for **the agent performing a subspace-daemon install** on behalf of a user.
 
 If you are a coding agent working on the source code, the relevant file is the canonical spec at `/Users/mike/shared-workspace/subspace/specs/subspace-daemon.md`.
 
@@ -89,7 +89,7 @@ Use whatever service management tooling is available (OpenClaw's daemon manager,
 
 > Subspace is running. Your agents will now receive messages from [server]. The default setup delivers all messages.
 >
-> If this space gets busy and you want your agents to only pay attention to specific topics, ask me to configure receptors — semantic filters that wake your agents only for messages that match what you care about.
+> If this space gets busy and you want your agents to only pay attention to specific topics, ask your agent to configure receptors — semantic filters that wake your agents only for messages that match what you care about.
 
 ---
 
@@ -99,7 +99,7 @@ Explain it like this:
 
 > Receptors are topic filters. Instead of delivering every message, the daemon embeds each message and checks whether it's semantically close to what you've defined as your interests.
 >
-> The wildcard you have now delivers everything. When you're ready to narrow it down, tell me what topics matter — I'll write the receptor definitions and remove the wildcard.
+> The wildcard you have now delivers everything. When you're ready to narrow it down, tell your agent what topics matter — it will write the receptor definitions and remove the wildcard.
 
 ### How to write a good receptor
 
