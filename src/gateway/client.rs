@@ -94,22 +94,42 @@ async fn run_gateway_task(
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut backoff = config.retry.base_ms;
+    let mut reconnecting = false;
     loop {
         if shutdown.try_recv().is_ok() {
             return Ok(());
         }
-        update_gateway_state(&status, "connecting").await;
-        info!(component = "gateway", event = "gateway_connecting", url = %config.gateway.ws_url, "connecting to gateway");
+        if reconnecting {
+            update_gateway_state(&status, "reconnecting").await;
+            info!(
+                component = "gateway",
+                event = "gateway_reconnecting",
+                url = %config.gateway.ws_url,
+                backoff_ms = backoff,
+                "reconnecting to gateway"
+            );
+        } else {
+            update_gateway_state(&status, "connecting").await;
+            info!(
+                component = "gateway",
+                event = "gateway_connecting",
+                url = %config.gateway.ws_url,
+                "connecting to gateway"
+            );
+        }
         match connect_once(&config, &identity, &status, &mut rx, &mut shutdown).await {
             Ok(DisconnectReason::Restart) => {
                 backoff = config.retry.base_ms;
+                reconnecting = false;
             }
             Ok(DisconnectReason::AuthFailed) => {
                 backoff = config.retry.base_ms;
+                reconnecting = false;
                 continue;
             }
             Ok(DisconnectReason::PairingRequired) => {
                 backoff = config.retry.base_ms;
+                reconnecting = false;
                 warn!(
                     component = "gateway",
                     event = "daemon_degraded",
@@ -119,10 +139,32 @@ async fn run_gateway_task(
             }
             Ok(DisconnectReason::Transport) => {
                 backoff = config.retry.base_ms;
-                warn!(component = "gateway", event = "daemon_degraded", reason = ?DisconnectReason::Transport, "gateway disconnected");
+                reconnecting = true;
+                update_gateway_state(&status, "reconnecting").await;
+                warn!(
+                    component = "gateway",
+                    event = "daemon_degraded",
+                    reason = ?DisconnectReason::Transport,
+                    "gateway disconnected"
+                );
             }
             Err(err) => {
-                warn!(component = "gateway", event = "daemon_degraded", error = %err, "gateway connect attempt failed");
+                if reconnecting {
+                    update_gateway_state(&status, "reconnecting").await;
+                    warn!(
+                        component = "gateway",
+                        event = "daemon_degraded",
+                        error = %err,
+                        "gateway reconnect attempt failed"
+                    );
+                } else {
+                    warn!(
+                        component = "gateway",
+                        event = "daemon_degraded",
+                        error = %err,
+                        "gateway connect attempt failed"
+                    );
+                }
             }
         }
         tokio::select! {
@@ -348,7 +390,10 @@ async fn connect_once(
                             method: "chat.send".to_string(),
                             params: Some(payload),
                         };
-                        write.send(Message::Text(serde_json::to_string(&frame)?)).await?;
+                        if let Err(err) = write.send(Message::Text(serde_json::to_string(&frame)?)).await {
+                            let _ = reply.send(Err(anyhow!("gateway transport unavailable: {err}")));
+                            return Ok(DisconnectReason::Transport);
+                        }
                         pending.insert(request_id, PendingRequest {
                             method: "chat.send".to_string(),
                             reply: oneshot_map_ok(reply),
@@ -360,8 +405,14 @@ async fn connect_once(
                 let Some(incoming) = incoming else {
                     return Ok(DisconnectReason::Transport);
                 };
-                let message = incoming?;
-                let text = ws_text(message)?;
+                let message = match incoming {
+                    Ok(message) => message,
+                    Err(_) => return Ok(DisconnectReason::Transport),
+                };
+                let text = match ws_text(message) {
+                    Ok(text) => text,
+                    Err(_) => return Ok(DisconnectReason::Transport),
+                };
                 if text.is_empty() {
                     continue;
                 }

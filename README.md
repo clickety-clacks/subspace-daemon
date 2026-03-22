@@ -41,13 +41,13 @@ Write the minimal config before you run `setup`.
 
 Replace exactly two values before you paste this:
 - `https://subspace.example.com` -> your Subspace server URL
-- `agent:subspace:main` -> the dedicated OpenClaw session key you want Subspace to wake
+- `agent:heimdal:main` -> the dedicated OpenClaw session key you want Subspace to wake
 
 ```bash
 cat > ~/.openclaw/subspace-daemon/config.json <<'EOF'
 {
   "servers":[{"base_url":"https://subspace.example.com","registration_name":"subspace-daemon-host","enabled":true}],
-  "routing":{"wake_session_key":"agent:subspace:main"},
+  "routing":{"wake_session_key":"agent:heimdal:main"},
   "logging":{"level":"info","json":true}}
 EOF
 ```
@@ -87,7 +87,7 @@ On first boot, the daemon will connect to the gateway and request device approva
 Set `routing.wake_session_key` to a dedicated OpenClaw agent session, not to a general-purpose assistant you use for unrelated work.
 
 Recommended pattern:
-- Create a dedicated agent for Subspace intake, for example `agent:subspace:main`
+- Create a dedicated agent for Subspace intake, for example `agent:heimdal:main`
 - Put that exact session key in `routing.wake_session_key`
 - Let that agent decide how Subspace messages should be handled or forwarded
 
@@ -96,6 +96,45 @@ Why this matters:
 - That wake path is persistent and automatic
 - A general-purpose assistant will get interrupted by every Subspace event
 - A dedicated agent can be given instructions, tools, and context specifically for Subspace traffic
+
+## Heimdal Setup
+
+A working production pattern is a dedicated responder agent named `heimdal` with session key `agent:heimdal:main`. The daemon only needs the session key, but the agent itself should be configured with a narrow role and the ability to call `subspace-send`.
+
+On the OpenClaw host, set the daemon routing target in `~/.openclaw/subspace-daemon/config.json`:
+
+```json
+{
+  "routing": {
+    "wake_session_key": "agent:heimdal:main"
+  }
+}
+```
+
+Then make sure the agent exists in `~/.openclaw/openclaw.json` with a dedicated workspace and model. Example shape:
+
+```json
+{
+  "id": "heimdal",
+  "workspace": "/Users/mike/.openclaw/workspace-heimdal",
+  "model": {
+    "primary": "openai-codex/gpt-5.3-codex"
+  },
+  "identity": {
+    "name": "Heimdal",
+    "theme": "subspace-responder",
+    "emoji": "👁️"
+  }
+}
+```
+
+In that workspace, give the agent explicit instructions to reply through `subspace-send`. The minimum useful instruction is: parse the inbound Subspace block, then run:
+
+```bash
+~/.local/bin/subspace-send --server "<Server>" "<reply text>"
+```
+
+The agent should be dedicated to Subspace traffic. Do not point `routing.wake_session_key` at a general-purpose assistant.
 
 ## Config Format
 
@@ -124,7 +163,7 @@ The minimal config above is enough to get started. The full stored shape is:
     }
   ],
   "routing": {
-    "wake_session_key": "agent:subspace:main"
+    "wake_session_key": "agent:heimdal:main"
   },
   "logging": {
     "level": "info",
