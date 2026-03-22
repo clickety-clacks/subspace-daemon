@@ -1,45 +1,53 @@
 # AGENTS.md — subspace-daemon
 
-This file is for AI coding agents working in this repository.
+This file is for **the OpenClaw agent performing a subspace-daemon install** on behalf of a user.
+
+If you are a coding agent working on the source code, the relevant file is the canonical spec at `/Users/mike/shared-workspace/subspace/specs/subspace-daemon.md`.
 
 ---
 
-## What this repo is
+## Your job during a first-time install
 
-`subspace-daemon` is a standalone Rust daemon that connects to one or more Subspace servers and delivers inbound messages to local OpenClaw agents via the gateway.
+You are setting up subspace-daemon so the user's agents can receive messages from a Subspace server. Before you touch any config files, **tell the user what they're getting**:
 
-It ships as a single binary and runs as a persistent launchd/systemd service.
+> Subspace is a message bus your agents listen to. When someone sends a message to a Subspace server you're subscribed to, it arrives at this daemon and gets routed to your agents — so they can read it, react to it, or surface it to you.
+>
+> By default we'll configure it to deliver everything. If the space gets noisy later, your agents can narrow it down to just the topics you care about using receptors. For now, you'll receive all messages.
+
+Then proceed with the install below.
 
 ---
 
-## First-time install: what to tell the user
+## Default install steps
 
-When you set up subspace-daemon for a user for the first time, explain the following in plain language before proceeding:
+### 1. Build and place the binary
 
-> **Subspace** is a message bus your agents listen to. When someone (or something) sends a message to a Subspace server you're subscribed to, it arrives at this daemon and gets routed to your agents.
->
-> **By default**, subspace-daemon is configured with an "all messages" receptor — a wildcard that collects every message and delivers it. This is the right starting point. You'll see everything.
->
-> **In noisy Subspace spaces**, where many unrelated messages flow, you'll want to replace or supplement the wildcard with *receptors* — semantic filters that wake your agents only for messages that match your interests. Your agents can configure those over time as the signal-to-noise ratio becomes clear.
->
-> For now, we'll set up the default wildcard config so you start receiving immediately.
+```bash
+cargo build --release
+cp target/release/subspace-daemon ~/.local/bin/subspace-daemon
+```
 
----
+### 2. Create the config directory
 
-## Default install config
+```bash
+mkdir -p ~/.openclaw/subspace-daemon/receptors/packs
+mkdir -p ~/.openclaw/subspace-daemon/logs
+```
 
-The default `config.json` for a new install should include a wildcard receptor so all messages are delivered. No embedding backend is required for wildcard operation.
+### 3. Write the default config
+
+`~/.openclaw/subspace-daemon/config.json`:
 
 ```json
 {
   "servers": [
     {
       "url": "http://<subspace-server>",
-      "api_key": "<your-api-key>"
+      "api_key": "<user-api-key>"
     }
   ],
   "delivery": {
-    "session_key": "<your-agent-session-key>"
+    "session_key": "<user-agent-session-key>"
   },
   "attention": {
     "receptors_path": "~/.openclaw/subspace-daemon/receptors",
@@ -48,64 +56,67 @@ The default `config.json` for a new install should include a wildcard receptor s
 }
 ```
 
-And a default receptor pack at `~/.openclaw/subspace-daemon/receptors/packs/default.json`:
+Fill in the server URL, API key, and the session key of the agent that should receive messages (e.g. `agent:heimdal:main`).
+
+### 4. Write the default wildcard receptor pack
+
+`~/.openclaw/subspace-daemon/receptors/packs/default.json`:
 
 ```json
 {
   "pack_id": "default",
-  "description": "Default all-messages receptor — delivers everything. Replace with topic receptors when the space gets noisy.",
+  "description": "Deliver all messages. Replace with topic receptors if the space gets noisy.",
   "receptors": [
     {
       "id": "all_messages",
-      "description": "Accept all messages",
       "class": "wildcard"
     }
   ]
 }
 ```
 
-This gets the user receiving immediately without requiring an embedding backend.
+The wildcard receptor requires no embedding backend — it accepts everything.
 
----
+### 5. Install and start the launchd service
 
-## When to recommend switching to topic receptors
+Use whatever service management tooling is available (OpenClaw's daemon manager, or manual plist). The daemon binary is:
 
-Tell the user to consider replacing the wildcard when:
-- They're subscribed to a high-volume space with many unrelated topics
-- Their agents are waking up on noise rather than signal
-- They have a clear domain they care about (e.g. visionOS dev, finance, a specific project)
-
-When they're ready, help them design receptors (see below) and remove the wildcard once the topic receptors are covering what matters.
-
----
-
-## Receptor authoring
-
-Read `docs/receptor-authoring.md` before writing or modifying any receptor.
-
-The short version:
-
-**Write examples in the language of the content, not the category.**
-- ❌ Bad: `"description": "Messages about Apple visionOS development"`
-- ✅ Good: `"description": "SwiftUI immersive space lifecycle, RealityKit anchors, visionOS scene transitions"`
-
-**Use negatives for exclusion, never the word NOT.**
-Negatives are embedded and subtracted as vectors. Writing "not about X" encodes X into the receptor.
-- ❌ Bad: `"negative_examples": ["not about Android", "not about gaming"]`
-- ✅ Good: `"negative_examples": ["Android app development", "Unity game engine"]`
-
-**Intersection receptors are powerful and precise.**
-`swift × visionOS` catches Swift+visionOS overlap without catching generic Swift or generic visionOS messages.
-
-**A wildcard receptor catches everything and requires no embedding backend:**
-```json
-{
-  "id": "all_messages",
-  "class": "wildcard"
-}
+```
+~/.local/bin/subspace-daemon serve --config ~/.openclaw/subspace-daemon/config.json
 ```
 
-**A semantic receptor requires an embedding backend in config:**
+### 6. Tell the user setup is complete
+
+> Subspace is running. Your agents will now receive messages from [server]. The default setup delivers all messages.
+>
+> If this space gets busy and you want your agents to only pay attention to specific topics, ask me to configure receptors — semantic filters that wake your agents only for messages that match what you care about.
+
+---
+
+## When the user asks about receptors
+
+Explain it like this:
+
+> Receptors are topic filters. Instead of delivering every message, the daemon embeds each message and checks whether it's semantically close to what you've defined as your interests.
+>
+> The wildcard you have now delivers everything. When you're ready to narrow it down, tell me what topics matter — I'll write the receptor definitions and remove the wildcard.
+
+### How to write a good receptor
+
+**Use the language of the content, not a category label.**
+- ❌ `"description": "Messages about visionOS development"` — lands near meta-discussion, not actual dev messages
+- ✅ `"description": "SwiftUI immersive space lifecycle, RealityKit anchors, visionOS scene transitions"` — lands in the right cluster
+
+**Negatives are vectors, not keywords. Never write "not about X".**
+The word NOT doesn't work — the model still encodes X. Write the negative examples as actual content from the unwanted domain:
+- ❌ `"negative_examples": ["not about Android"]`
+- ✅ `"negative_examples": ["Android Jetpack Compose", "Google Play Store submission"]`
+
+**Intersection receptors are precise and powerful.**
+A receptor for `swift × visionOS` catches the overlap without catching generic Swift questions or generic visionOS discussion.
+
+### Example topic receptor (requires embedding backend)
+
 ```json
 {
   "id": "visionos_dev",
@@ -123,55 +134,36 @@ Negatives are embedded and subtracted as vectors. Writing "not about X" encodes 
 }
 ```
 
-Full receptor authoring guide: `docs/receptor-authoring.md`
+To use semantic receptors you need an embedding backend in `config.json`. The reference backend script is `~/.local/bin/subspace-embed-openai` (OpenAI `text-embedding-3-small`). See the canonical spec for backend config details.
+
+### When to remove the wildcard
+
+Once the user has topic receptors covering what they care about, remove `default.json` (or delete the wildcard entry from it). The daemon will then only wake agents for matched messages.
 
 ---
 
-## Canonical spec
+## Key facts for coding agents
 
-```
-/Users/mike/shared-workspace/subspace/specs/subspace-daemon.md
-```
-
-Spec wins over code if they conflict. Flag the conflict, don't silently resolve it.
-
----
-
-## Repo structure
+Repo structure, invariants, and test procedures:
 
 ```
 src/
-  config.rs        — config schema and server_key derivation
-  main.rs          — CLI entry point (serve / setup / send)
+  config.rs        — config schema
+  main.rs          — CLI (serve / setup / send)
   supervisor.rs    — WebSocket manager, delivery router
-  gateway/         — gateway auth, device pairing, chat.send
-  subspace/        — Subspace auth, firehose WebSocket client
+  gateway/         — gateway auth, chat.send
+  subspace/        — Subspace WebSocket client
   attention/       — receptor matching, embedding plugin, scoring
-  ipc.rs           — Unix socket IPC for outbound sends
-  runtime_store.rs — per-server state persistence
-  state_lock.rs    — exclusive lock between serve and setup
-  logging.rs       — structured JSON logging
+  ipc.rs           — Unix socket IPC
 docs/
-  receptor-authoring.md  — how to write effective receptor packs
+  receptor-authoring.md  — detailed receptor authoring guide
 ```
 
----
-
-## Key invariants
-
-1. Each message is delivered exactly once regardless of how many receptors match.
-2. Wildcard receptor (`class: wildcard`) requires no embedding backend — use for default installs.
-3. Semantic receptors require an embedding backend configured in `config.json`.
-4. Plaintext messages remain valid without any semantic metadata.
+Invariants:
+1. Each message delivered exactly once regardless of receptor match count.
+2. Wildcard receptor requires no embedding backend.
+3. Semantic receptors require a configured embedding backend.
+4. No receptors configured = wildcard behavior by default.
 5. Vectors from different `space_id` values are never compared.
-6. If no receptors are configured, daemon defaults to wildcard behavior.
 
----
-
-## Testing
-
-No automated test suite yet. Manual verification:
-- Build: `cargo build --release`
-- Run: `~/.local/bin/subspace-daemon serve`
-- Test inbound: send from eezo `subspace-ext` session (not TARS-local — self-filters)
-- Test outbound: `~/.local/bin/subspace-daemon send "message text"`
+Canonical spec: `/Users/mike/shared-workspace/subspace/specs/subspace-daemon.md` — wins over code if they conflict.
