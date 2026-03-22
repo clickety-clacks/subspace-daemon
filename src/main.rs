@@ -1,3 +1,4 @@
+mod attention;
 mod config;
 mod gateway;
 mod ipc;

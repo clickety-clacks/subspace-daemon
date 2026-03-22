@@ -5,8 +5,9 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
+use crate::attention::{AttentionLayer, AttentionResult, format_attention_annotation};
 use crate::config::{Config, RetryConfig};
 use crate::gateway::client::{GatewayClientHandle, start_gateway_client};
 use crate::ipc::{SendRouter, run_ipc_server};
@@ -133,6 +134,18 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
 
     let status = Arc::new(RwLock::new(DaemonStatus::new(&config)));
     let (shutdown_tx, _) = broadcast::channel(4);
+
+    // Initialize attention layer
+    let attention = AttentionLayer::new(config.attention.clone()).await?;
+    let attention = Arc::new(attention);
+    info!(
+        component = "supervisor",
+        event = "attention_layer_initialized",
+        receptor_count = attention.receptor_count(),
+        degraded = attention.is_degraded(),
+        "attention layer initialized"
+    );
+
     let (gateway, gateway_task) =
         start_gateway_client(config.clone(), status.clone(), shutdown_tx.subscribe()).await?;
 
@@ -159,6 +172,7 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
         gateway.clone(),
         config.routing.wake_session_key.clone(),
         config.retry.clone(),
+        attention.clone(),
         shutdown_tx.subscribe(),
     ));
     let ipc_task = tokio::spawn(run_ipc_server(
@@ -254,6 +268,7 @@ async fn process_wake_queue(
     gateway: GatewayClientHandle,
     wake_session_key: String,
     retry: RetryConfig,
+    attention: Arc<AttentionLayer>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut shutting_down = false;
@@ -279,7 +294,27 @@ async fn process_wake_queue(
             return Ok(());
         };
 
-        let rendered = render_inbound_wake(&item);
+        // Evaluate message against receptors
+        let attention_result = attention.evaluate(&item.text).await;
+
+        if !attention_result.deliver {
+            // Message filtered out by attention layer
+            debug!(
+                component = "wake_router",
+                event = "message_filtered",
+                message_id = %item.message_id,
+                server = %item.server,
+                top_score = attention_result.matches.first().map(|m| m.score),
+                "message filtered by attention layer"
+            );
+            // Mark as processed so we don't retry
+            let mut runtime = item.runtime.lock().await;
+            runtime.mark_processed(&item.message_id, &item.timestamp);
+            runtime.flush()?;
+            continue;
+        }
+
+        let rendered = render_inbound_wake(&item, &attention_result);
         let mut backoff_ms = retry.base_ms;
         loop {
             let send_future = gateway.send_chat(
@@ -305,7 +340,17 @@ async fn process_wake_queue(
                     let mut runtime = item.runtime.lock().await;
                     runtime.mark_processed(&item.message_id, &item.timestamp);
                     runtime.flush()?;
-                    info!(component = "wake_router", event = "wake_sent", message_id = %item.message_id, server = %item.server, session_key = %wake_session_key, "wake sent");
+                    info!(
+                        component = "wake_router",
+                        event = "wake_sent",
+                        message_id = %item.message_id,
+                        server = %item.server,
+                        session_key = %wake_session_key,
+                        receptor_matches = attention_result.matches.iter()
+                            .filter(|m| m.above_threshold)
+                            .count(),
+                        "wake sent"
+                    );
                     break;
                 }
                 Err(err) => {
@@ -328,14 +373,28 @@ async fn process_wake_queue(
     }
 }
 
-fn render_inbound_wake(message: &WakeEnvelope) -> String {
+fn render_inbound_wake(message: &WakeEnvelope, attention: &AttentionResult) -> String {
     let from = if message.author_name.trim().is_empty() {
         message.author_id.as_str()
     } else {
         message.author_name.as_str()
     };
-    format!(
-        "[Subspace inbound]\nServer: {}\nServerKey: {}\nFrom: {}\nMessageId: {}\n\n{}",
-        message.server, message.server_key, from, message.message_id, message.text,
-    )
+
+    let mut lines = vec![
+        "[Subspace inbound]".to_string(),
+        format!("Server: {}", message.server),
+        format!("ServerKey: {}", message.server_key),
+        format!("From: {}", from),
+        format!("MessageId: {}", message.message_id),
+    ];
+
+    // Add receptor match annotations if any
+    if let Some(annotation) = format_attention_annotation(attention) {
+        lines.push(annotation);
+    }
+
+    lines.push(String::new()); // blank line before text
+    lines.push(message.text.clone());
+
+    lines.join("\n")
 }

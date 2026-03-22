@@ -6,12 +6,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::attention::{AttentionConfig, embedding_plugin::EmbeddingBackendConfig};
 use crate::runtime_store::write_json_atomic;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub gateway: GatewayConfig,
     pub servers: Vec<ServerConfig>,
+    pub attention: AttentionConfig,
     pub routing: RoutingConfig,
     pub logging: LoggingConfig,
     pub retry: RetryConfig,
@@ -79,6 +81,8 @@ pub struct StoredConfig {
     #[serde(default)]
     pub servers: Vec<StoredServerConfig>,
     #[serde(default)]
+    pub attention: StoredAttentionConfig,
+    #[serde(default)]
     pub routing: StoredRoutingConfig,
     #[serde(default)]
     pub ipc: StoredIpcConfig,
@@ -132,11 +136,36 @@ pub struct StoredRetryConfig {
     pub jitter_ratio: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StoredAttentionConfig {
+    #[serde(default)]
+    pub local_pack_paths: Vec<String>,
+    #[serde(default)]
+    pub embedding_backends: Vec<StoredEmbeddingBackend>,
+    pub threshold: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StoredEmbeddingBackend {
+    pub backend_id: String,
+    pub exec: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub default_space_id: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
 impl Default for StoredConfig {
     fn default() -> Self {
         Self {
             gateway: StoredGatewayConfig::default(),
             servers: vec![],
+            attention: StoredAttentionConfig::default(),
             routing: StoredRoutingConfig::default(),
             ipc: StoredIpcConfig::default(),
             logging: StoredLoggingConfig::default(),
@@ -205,9 +234,35 @@ impl Config {
             });
         }
 
+        // Build attention config
+        let embedding_backends = stored
+            .attention
+            .embedding_backends
+            .into_iter()
+            .map(|b| EmbeddingBackendConfig {
+                backend_id: b.backend_id,
+                exec_path: expand_tilde(PathBuf::from(&b.exec))
+                    .to_string_lossy()
+                    .to_string(),
+                args: b.args,
+                default_space_id: b.default_space_id,
+                enabled: b.enabled,
+            })
+            .collect();
+
+        let attention = AttentionConfig {
+            local_pack_paths: stored.attention.local_pack_paths,
+            embedding_backends,
+            threshold: stored
+                .attention
+                .threshold
+                .unwrap_or(crate::attention::DEFAULT_THRESHOLD),
+        };
+
         Ok(Self {
             gateway,
             servers,
+            attention,
             routing: RoutingConfig {
                 wake_session_key: stored
                     .routing
