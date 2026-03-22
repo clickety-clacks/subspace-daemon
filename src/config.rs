@@ -154,6 +154,9 @@ pub struct StoredEmbeddingBackend {
     pub default_space_id: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Environment variables to pass to the plugin subprocess.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 fn default_enabled() -> bool {
@@ -247,6 +250,7 @@ impl Config {
                 args: b.args,
                 default_space_id: b.default_space_id,
                 enabled: b.enabled,
+                env: b.env,
             })
             .collect();
 

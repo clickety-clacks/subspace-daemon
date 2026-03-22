@@ -3,13 +3,18 @@
 //! Spawns a configured executable, sends JSON requests on stdin, reads JSON responses from stdout.
 //! Per the CLI/plugin spec in subspace-embedding-cli-plugin-spec.md.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+/// Timeout for embedding plugin subprocess calls.
+const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for an embedding backend executable.
 #[derive(Debug, Clone)]
@@ -19,6 +24,8 @@ pub struct EmbeddingBackendConfig {
     pub args: Vec<String>,
     pub default_space_id: String,
     pub enabled: bool,
+    /// Environment variables to pass to the subprocess.
+    pub env: HashMap<String, String>,
 }
 
 /// Request to describe backend capabilities.
@@ -174,11 +181,18 @@ impl EmbeddingPluginClient {
     async fn invoke<R: serde::de::DeserializeOwned>(&self, request: &impl Serialize) -> Result<R> {
         let request_json = serde_json::to_string(request)?;
 
-        let mut child = Command::new(&self.config.exec_path)
-            .args(&self.config.args)
+        let mut cmd = Command::new(&self.config.exec_path);
+        cmd.args(&self.config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Pass environment variables from config to subprocess
+        for (key, value) in &self.config.env {
+            cmd.env(key, value);
+        }
+
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn embedding plugin: {}", self.config.exec_path))?;
 
@@ -187,7 +201,10 @@ impl EmbeddingPluginClient {
         stdin.write_all(b"\n").await?;
         stdin.shutdown().await?;
 
-        let output = child.wait_with_output().await
+        // Wait for output with timeout to avoid hanging indefinitely
+        let output = tokio::time::timeout(PLUGIN_TIMEOUT, child.wait_with_output())
+            .await
+            .with_context(|| format!("embedding plugin timed out after {:?}", PLUGIN_TIMEOUT))?
             .with_context(|| "failed to wait for embedding plugin")?;
 
         if !output.status.success() {
