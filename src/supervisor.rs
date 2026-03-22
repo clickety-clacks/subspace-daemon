@@ -164,7 +164,15 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
         server_handles.insert(server.base_url.clone(), handle);
         server_tasks.push((server.server_key.clone(), task));
     }
-    drop(wake_tx);
+    // Only drop the original wake_tx if at least one server manager was started.
+    // Otherwise, keep it alive to prevent wake_rx from immediately seeing None
+    // (which would cause the wake_queue to exit unexpectedly).
+    let _wake_tx_keepalive = if server_tasks.is_empty() {
+        Some(wake_tx)
+    } else {
+        drop(wake_tx);
+        None
+    };
 
     let send_router = SendRouter::new(status.clone(), server_handles.clone());
     let wake_task = tokio::spawn(process_wake_queue(
