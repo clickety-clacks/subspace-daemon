@@ -107,6 +107,7 @@ pub struct ServerSendResultEnvelope {
 pub struct WakeEnvelope {
     pub server: String,
     pub server_key: String,
+    pub server_name: Option<String>,
     pub message_id: String,
     pub timestamp: String,
     pub author_id: String,
@@ -388,9 +389,15 @@ fn render_inbound_wake(message: &WakeEnvelope, attention: &AttentionResult) -> S
         message.author_name.as_str()
     };
 
+    // Format server line: "Name (url)" if server_name available, else just url
+    let server_display = match &message.server_name {
+        Some(name) => format!("{} ({})", name, message.server),
+        None => message.server.clone(),
+    };
+
     let mut lines = vec![
         "[Subspace inbound]".to_string(),
-        format!("Server: {}", message.server),
+        format!("Server: {}", server_display),
         format!("ServerKey: {}", message.server_key),
         format!("From: {}", from),
         format!("MessageId: {}", message.message_id),

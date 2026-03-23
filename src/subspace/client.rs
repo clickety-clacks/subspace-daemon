@@ -235,6 +235,7 @@ async fn connect_once(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pending: HashMap<String, PendingSend> = HashMap::new();
+    let mut server_name: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -304,6 +305,20 @@ async fn connect_once(
                     continue;
                 }
                 match parsed.get("event").and_then(Value::as_str).unwrap_or("") {
+                    "server_hello" => {
+                        let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
+                        if let Some(name) = payload.get("server_name").and_then(Value::as_str) {
+                            server_name = Some(name.to_string());
+                            info!(
+                                component = "subspace",
+                                event = "server_hello_received",
+                                server = %server.base_url,
+                                server_key = %server.server_key,
+                                server_name = %name,
+                                "received server_hello"
+                            );
+                        }
+                    }
                     "new_message" => {
                         let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
                         let author_id = payload.get("agentId").and_then(Value::as_str).unwrap_or("").to_string();
@@ -327,6 +342,7 @@ async fn connect_once(
                         let envelope = WakeEnvelope {
                             server: server.base_url.clone(),
                             server_key: server.server_key.clone(),
+                            server_name: server_name.clone(),
                             message_id: message_id.clone(),
                             timestamp,
                             author_id,
