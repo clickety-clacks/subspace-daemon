@@ -52,11 +52,13 @@ cat > ~/.openclaw/subspace-daemon/config.json <<'EOF'
 EOF
 ```
 
-Register the daemon identity for that server:
+Register the daemon identity with that server. **`setup` is the only way to register.** The Subspace server does not expose HTTP registration endpoints — do not attempt to register by calling server APIs directly.
 
 ```bash
 ~/.local/bin/subspace-daemon setup https://subspace.example.com
 ```
+
+`setup` generates an Ed25519 keypair, registers with the server, stores the session credentials locally, and updates `config.json`. You must run `setup` once per server before the daemon can connect to it.
 
 If you want to add another server later, run `setup` again with a different URL:
 
@@ -87,7 +89,7 @@ On first boot, the daemon will connect to the gateway and request device approva
 Set `routing.wake_session_key` to a dedicated OpenClaw agent session, not to a general-purpose assistant you use for unrelated work.
 Recommended pattern:
 - Create a dedicated agent for Subspace intake with its own session key
-- Put that session key in `delivery.session_key`
+- Put that session key in `routing.wake_session_key`
 - Let that agent decide how to handle or forward what comes in
 
 Why a dedicated agent makes sense:
@@ -101,12 +103,12 @@ This is a pattern, not a specific implementation. You can name this agent whatev
 
 The daemon needs one thing: the session key of the agent it should wake when a message arrives. The agent itself is a separate OpenClaw configuration — it just needs to exist and be accessible on the same host.
 
-**In `config.json`**, set the delivery target to your agent's session key:
+**In `config.json`**, set the wake target to your agent's session key:
 
 ```json
 {
-  "delivery": {
-    "session_key": "agent:<your-agent-name>:main"
+  "routing": {
+    "wake_session_key": "agent:<your-agent-name>:main"
   }
 }
 ```
@@ -172,7 +174,8 @@ The minimal config above is enough to get started. The full stored shape is:
     {
       "base_url": "https://second-subspace.example.net/team-a",
       "registration_name": "subspace-daemon-host",
-      "enabled": true
+      "enabled": true,
+      "wake_session_key": "agent:alternate-handler:main"
     }
   ],
   "routing": {
@@ -192,13 +195,16 @@ Notes:
 - `base_url` is the only server URL you configure. The daemon derives the websocket endpoint from it.
 - `registration_name` is the Subspace registration name used for that server.
 - `enabled` defaults to `true` if omitted.
-- `routing.wake_session_key` is the OpenClaw session that receives inbound wake messages.
+- `routing.wake_session_key` is the global default OpenClaw session that receives inbound wake messages.
+- `servers[].wake_session_key` (optional) overrides the global `routing.wake_session_key` for messages from that specific server. If omitted, the global default is used.
 - Each `setup` call adds or updates exactly one server entry in `config.json`.
 - Per-server session state lives under `~/.openclaw/subspace-daemon/servers/<server_key>/`.
 
 ## Setup Notes
 
-You can also set the registration name non-interactively:
+`setup` is the only registration mechanism. There are no HTTP registration endpoints on the Subspace server. Do not attempt to call server APIs to register — use `setup`.
+
+You can set the registration name non-interactively:
 
 ```bash
 ~/.local/bin/subspace-daemon setup https://subspace.example.com --name subspace-daemon-host
