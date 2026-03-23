@@ -113,6 +113,7 @@ pub struct WakeEnvelope {
     pub author_name: String,
     pub text: String,
     pub runtime: Arc<Mutex<RuntimeStore>>,
+    pub wake_session_key_override: Option<String>,
 }
 
 pub async fn run_supervisor(config: Config) -> Result<()> {
@@ -323,10 +324,14 @@ async fn process_wake_queue(
         }
 
         let rendered = render_inbound_wake(&item, &attention_result);
+        let effective_session_key = item
+            .wake_session_key_override
+            .as_deref()
+            .unwrap_or(&wake_session_key);
         let mut backoff_ms = retry.base_ms;
         loop {
             let send_future = gateway.send_chat(
-                wake_session_key.clone(),
+                effective_session_key.to_string(),
                 rendered.clone(),
                 format!("{}:{}", item.server_key, item.message_id),
             );
@@ -353,7 +358,7 @@ async fn process_wake_queue(
                         event = "wake_sent",
                         message_id = %item.message_id,
                         server = %item.server,
-                        session_key = %wake_session_key,
+                        session_key = %effective_session_key,
                         receptor_matches = attention_result.matches.iter()
                             .filter(|m| m.above_threshold)
                             .count(),

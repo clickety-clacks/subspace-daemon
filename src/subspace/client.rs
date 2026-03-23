@@ -338,6 +338,7 @@ async fn connect_once(
                                 .to_string(),
                             text,
                             runtime: runtime.clone(),
+                            wake_session_key_override: server.wake_session_key.clone(),
                         };
                         match wake_tx.try_send(envelope) {
                             Ok(()) => {

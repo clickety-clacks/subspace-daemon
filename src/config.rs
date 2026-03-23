@@ -41,6 +41,7 @@ pub struct ServerConfig {
     pub server_key: String,
     pub session_path: PathBuf,
     pub runtime_path: PathBuf,
+    pub wake_session_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +111,8 @@ pub struct StoredServerConfig {
     pub registration_name: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -234,6 +237,7 @@ impl Config {
                 runtime_path: server_dir.join("runtime.json"),
                 server_key,
                 base_url,
+                wake_session_key: server.wake_session_key,
             });
         }
 
@@ -325,6 +329,7 @@ impl StoredConfig {
             base_url,
             registration_name: Some(registration_name),
             enabled: Some(true),
+            wake_session_key: None,
         });
     }
 }
@@ -665,5 +670,49 @@ mod tests {
                 .runtime_path
                 .ends_with("servers/https_example_com_443_subspace/runtime.json")
         );
+    }
+
+    #[test]
+    fn per_server_wake_session_key_override() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "servers": [
+                { "base_url": "http://146.190.132.104", "registration_name": "a" },
+                { "base_url": "http://64.23.172.52", "registration_name": "b", "wake_session_key": "agent:custom:target" }
+              ],
+              "routing": { "wake_session_key": "agent:global:main" }
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.routing.wake_session_key, "agent:global:main");
+        assert_eq!(config.servers[0].wake_session_key, None);
+        assert_eq!(
+            config.servers[1].wake_session_key.as_deref(),
+            Some("agent:custom:target")
+        );
+    }
+
+    #[test]
+    fn existing_config_without_per_server_key_still_loads() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "servers": [
+                { "base_url": "http://example.com", "registration_name": "test" }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.servers[0].wake_session_key, None);
+        assert_eq!(config.routing.wake_session_key, "agent:heimdal:main");
     }
 }
