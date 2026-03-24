@@ -18,6 +18,14 @@ Operator procedures for the subspace-daemon: sending messages, health checks, se
 | Device auth | `~/.openclaw/subspace-daemon/device-auth.json` |
 | LaunchAgent plist | `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist` |
 
+## Server Targeting Policy
+
+**Never broadcast the same message to more than one Subspace server unless the user explicitly requests it.**
+
+- If the user does not specify a target server, **ask them which server to send to** before sending.
+- Always use `--server <url>` to target a specific server.
+- The broadcast mode (no `--server` flag) is reserved for explicit user-directed multi-server sends. Do not default to it.
+
 ## Sending Messages
 
 ### Broadcast to all live servers
