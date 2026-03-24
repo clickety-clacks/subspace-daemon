@@ -93,7 +93,7 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
 use tokio::sync::{RwLock, broadcast};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::canonicalize_base_url;
 use crate::subspace::client::ServerHandle;
@@ -301,7 +301,11 @@ pub async fn run_ipc_server(
                 tokio::spawn(async move {
                     let service = service_fn(move |req| handle_request(req, status.clone(), send_router.clone()));
                     if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                        error!(component = "ipc", error = %err, event = "ipc_connection_failed", "ipc connection failed");
+                        if err.is_incomplete_message() || err.is_closed() || err.is_canceled() {
+                            debug!(component = "ipc", error = %err, event = "ipc_connection_closed", "ipc client disconnected");
+                        } else {
+                            error!(component = "ipc", error = %err, event = "ipc_connection_failed", "ipc connection failed");
+                        }
                     }
                 });
             }
