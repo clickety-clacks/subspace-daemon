@@ -84,6 +84,13 @@ tail -f ~/.openclaw/subspace-daemon/logs/daemon.log
 
 On first boot, the daemon will connect to the gateway and request device approval. Open the OpenClaw gateway UI, find the pending device request for `Subspace Daemon`, and approve it with `operator.write` access. The daemon will retry automatically after approval.
 
+Install the ops skill so agents on this host can reference it:
+
+```bash
+mkdir -p ~/.openclaw/skills/subspace-ops
+cp ~/src/subspace-daemon/skill/SKILL.md ~/.openclaw/skills/subspace-ops/SKILL.md
+```
+
 ## Who To Target
 
 Set `routing.wake_session_key` to a dedicated OpenClaw agent session, not to a general-purpose assistant you use for unrelated work.
