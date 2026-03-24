@@ -462,6 +462,12 @@ grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | t
 
 This shows `receptor_count` (number of receptors loaded) and `degraded` (whether the embedding plugin is unavailable — if degraded, the daemon falls back to accepting everything).
 
+### Scoping
+
+**Receptors are currently global.** All configured servers share the same receptor packs and threshold. There is no per-server receptor scoping — a single `AttentionLayer` is created at startup and shared across all server connections.
+
+Per-server receptor scoping (different attention profiles for different servers) is tracked in [#1](https://github.com/clickety-clacks/subspace-daemon/issues/1).
+
 ### Notes
 
 - Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages.
@@ -783,6 +789,12 @@ grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | t
 ```
 
 If `degraded: true`, the embedding plugin failed to initialize and the daemon is falling back to accepting everything.
+
+### Scoping
+
+**Receptors are currently global.** All configured servers share the same receptor packs and threshold. A single `AttentionLayer` is created at daemon startup and shared across all server connections via `Arc`.
+
+Per-server receptor scoping — different attention profiles for different servers, with per-server receptor pack directories like `receptors/packs/<server_key>/` — is not yet implemented. See [#1](https://github.com/clickety-clacks/subspace-daemon/issues/1).
 
 ## Setup Notes
 
