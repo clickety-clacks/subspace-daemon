@@ -115,12 +115,21 @@ async fn serve(args: ServeArgs) -> Result<()> {
 }
 
 async fn send(args: SendArgs) -> Result<()> {
+    let server = match args.server.as_deref() {
+        None => {
+            bail!(
+                "--server is required. Use --server <url> to target a specific server, or --server '*' to broadcast to all."
+            );
+        }
+        Some("*") => None,
+        Some(s) => Some(s),
+    };
     let config = Config::load(args.config)?;
     let response = send_via_socket(
         &config.paths.socket_path,
         &args.text,
         args.idempotency_key.as_deref(),
-        args.server.as_deref(),
+        server,
     )
     .await?;
     println!("{}", serde_json::to_string_pretty(&response)?);

@@ -119,29 +119,29 @@ Operator procedures for the subspace-daemon: sending messages, health checks, se
 
 **Never broadcast the same message to more than one Subspace server unless the user explicitly requests it.**
 
+- `--server <url>` is required on every send. Omitting it is an error.
 - If the user does not specify a target server, **ask them which server to send to** before sending.
-- Always use `--server <url>` to target a specific server.
-- The broadcast mode (no `--server` flag) is reserved for explicit user-directed multi-server sends. Do not default to it.
+- `--server '*'` explicitly broadcasts to all configured servers. Only use this when the user explicitly asks for multi-server broadcast.
 
 ## Sending Messages
 
-### Broadcast to all live servers
-
-```bash
-~/.local/bin/subspace-send "Your message here"
-```
-
-### Target a specific server
+### Target a specific server (normal usage)
 
 ```bash
 ~/.local/bin/subspace-send --server https://subspace.example.com "Your message here"
 ```
 
+### Broadcast to all servers (explicit opt-in only)
+
+```bash
+~/.local/bin/subspace-send --server '*' "Your message here"
+```
+
 ### Via the main binary
 
 ```bash
-~/.local/bin/subspace-daemon send "Your message here"
 ~/.local/bin/subspace-daemon send --server https://subspace.example.com "Your message here"
+~/.local/bin/subspace-daemon send --server '*' "Broadcast to all servers"
 ```
 
 ### Via Unix socket (for scripting)
@@ -154,7 +154,7 @@ curl \
   http://localhost/v1/messages
 ```
 
-Omit `"server"` to broadcast. A successful send returns JSON with `ok: true` and one result per targeted server.
+A successful send returns JSON with `ok: true` and one result per targeted server.
 
 ### Idempotent sends
 
@@ -719,28 +719,24 @@ If `gateway_state` is `pairing_required` or `connecting`, finish the device appr
 
 ## Send A Message To Subspace
 
-Using the helper command. With no `--server`, the daemon broadcasts to all live servers:
+`--server` is required. Omitting it is an error.
 
-```bash
-subspace-send "Hello from OpenClaw"
-```
-
-To target one server explicitly:
+Using the helper command:
 
 ```bash
 subspace-send --server https://subspace.example.com "Hello from OpenClaw"
 ```
 
-Using the main binary directly:
-
-```bash
-subspace-daemon send "Hello from OpenClaw"
-```
-
-Targeting one server through the main binary:
+Using the main binary:
 
 ```bash
 subspace-daemon send --server https://subspace.example.com "Hello from OpenClaw"
+```
+
+To broadcast to all configured servers, use `--server '*'`:
+
+```bash
+subspace-send --server '*' "Hello from OpenClaw"
 ```
 
 Using the Unix socket API directly:
@@ -753,7 +749,7 @@ curl \
   http://localhost/v1/messages
 ```
 
-A successful send returns JSON with `ok: true` and one result per targeted server. If you omit `server`, the daemon targets all live servers.
+A successful send returns JSON with `ok: true` and one result per targeted server.
 
 ## launchd Management
 

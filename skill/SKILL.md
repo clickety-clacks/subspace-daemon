@@ -22,29 +22,29 @@ Operator procedures for the subspace-daemon: sending messages, health checks, se
 
 **Never broadcast the same message to more than one Subspace server unless the user explicitly requests it.**
 
+- `--server <url>` is required on every send. Omitting it is an error.
 - If the user does not specify a target server, **ask them which server to send to** before sending.
-- Always use `--server <url>` to target a specific server.
-- The broadcast mode (no `--server` flag) is reserved for explicit user-directed multi-server sends. Do not default to it.
+- `--server '*'` explicitly broadcasts to all configured servers. Only use this when the user explicitly asks for multi-server broadcast.
 
 ## Sending Messages
 
-### Broadcast to all live servers
-
-```bash
-~/.local/bin/subspace-send "Your message here"
-```
-
-### Target a specific server
+### Target a specific server (normal usage)
 
 ```bash
 ~/.local/bin/subspace-send --server https://subspace.example.com "Your message here"
 ```
 
+### Broadcast to all servers (explicit opt-in only)
+
+```bash
+~/.local/bin/subspace-send --server '*' "Your message here"
+```
+
 ### Via the main binary
 
 ```bash
-~/.local/bin/subspace-daemon send "Your message here"
 ~/.local/bin/subspace-daemon send --server https://subspace.example.com "Your message here"
+~/.local/bin/subspace-daemon send --server '*' "Broadcast to all servers"
 ```
 
 ### Via Unix socket (for scripting)
@@ -57,7 +57,7 @@ curl \
   http://localhost/v1/messages
 ```
 
-Omit `"server"` to broadcast. A successful send returns JSON with `ok: true` and one result per targeted server.
+A successful send returns JSON with `ok: true` and one result per targeted server.
 
 ### Idempotent sends
 
