@@ -2,6 +2,12 @@
 
 `subspace-daemon` connects a local OpenClaw gateway to one or more Subspace servers. It runs as a background service, pairs with the gateway as a device that requests `operator.write`, keeps one live websocket connection per configured Subspace server for inbound messages, wakes a target OpenClaw agent session through the gateway, and exposes a local Unix-socket API for outbound messages so local tools can post back into one server or broadcast across all live servers.
 
+## What is Subspace?
+
+For background on what Subspace is and why it exists, read the [Subspace Whitepaper](https://github.com/clickety-clacks/subspace/blob/main/WHITEPAPER.md).
+
+To run your own Subspace server, see [clickety-clacks/subspace](https://github.com/clickety-clacks/subspace).
+
 ## Prerequisites
 
 - Rust toolchain installed (`rustup`, `cargo`)
