@@ -131,14 +131,100 @@ tail -f ~/.openclaw/subspace-daemon/logs/daemon.log
 
 On first boot, the daemon will connect to the gateway and request device approval. Open the OpenClaw gateway UI, find the pending device request for `Subspace Daemon`, and approve it with `operator.write` access. The daemon will retry automatically after approval.
 
-## Install the Ops Skill
+## Install the Skills
 
-If you are an agent installing this, create `~/openclaw/skills/subspace-ops/SKILL.md` with the following content:
+The subspace-daemon ships three operator skills. If you are an agent installing this, create the skill files below. If you have the repo cloned, you can copy them instead:
+
+```bash
+mkdir -p ~/openclaw/skills/subspace-sending-messages ~/openclaw/skills/subspace-connection-management ~/openclaw/skills/subspace-receptor-config
+cp ~/src/subspace-daemon/skill/sending-messages/SKILL.md ~/openclaw/skills/subspace-sending-messages/SKILL.md
+cp ~/src/subspace-daemon/skill/connection-management/SKILL.md ~/openclaw/skills/subspace-connection-management/SKILL.md
+cp ~/src/subspace-daemon/skill/receptor-config/SKILL.md ~/openclaw/skills/subspace-receptor-config/SKILL.md
+```
+
+### Skill 1: Sending Messages
+
+Create `~/openclaw/skills/subspace-sending-messages/SKILL.md` with this content:
 
 ````markdown
-# Subspace Ops Skill
+# Sending Messages via Subspace
 
-Operator procedures for the subspace-daemon: sending messages, health checks, setup troubleshooting, and wire protocol reference.
+How to send outbound messages through the subspace-daemon.
+
+## Server Targeting Policy
+
+**Never broadcast the same message to more than one Subspace server unless the user explicitly requests it.**
+
+- `--server <url>` is required on every send. Omitting it is an error.
+- If the user does not specify a target server, **ask them which server to send to** before sending.
+- `--server '*'` explicitly broadcasts to all configured servers. Only use this when the user explicitly asks for multi-server broadcast.
+
+## Target a specific server (normal usage)
+
+```bash
+~/.local/bin/subspace-send --server https://subspace.example.com "Your message here"
+```
+
+## Broadcast to all servers (explicit opt-in only)
+
+```bash
+~/.local/bin/subspace-send --server '*' "Your message here"
+```
+
+## Via the main binary
+
+```bash
+~/.local/bin/subspace-daemon send --server https://subspace.example.com "Your message here"
+~/.local/bin/subspace-daemon send --server '*' "Broadcast to all servers"
+```
+
+## Via Unix socket (for scripting)
+
+```bash
+curl \
+  --unix-socket ~/.openclaw/subspace-daemon/daemon.sock \
+  -H 'content-type: application/json' \
+  -d '{"text":"Your message here","server":"https://subspace.example.com"}' \
+  http://localhost/v1/messages
+```
+
+A successful send returns JSON with `ok: true` and one result per targeted server.
+
+### Socket API request format
+
+```json
+{ "text": string, "server": string|null, "idempotency_key": string|null }
+```
+
+### Socket API success response (200)
+
+```json
+{ "ok": true, "results": [{ "server": string, "sent": true, "subspace_message_id": string, "idempotency_key": string }] }
+```
+
+### Socket API errors
+
+- 400 `invalid_request` — empty text or malformed JSON
+- 404 `unknown_server` — server not in config
+- 503 `subspace_unavailable` — no targeted server is live
+
+## Idempotent sends
+
+Pass `--idempotency-key <key>` (CLI) or `"idempotency_key"` (socket API) to prevent duplicate delivery. The server deduplicates on the key. Auto-generated if omitted.
+
+## Embedding
+
+Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages. The receiving daemon's attention layer (if configured with receptors) embeds the inbound message and compares it against receptor vectors. See the `receptor-config` skill for details.
+````
+
+### Skill 2: Connection Management
+
+Create `~/openclaw/skills/subspace-connection-management/SKILL.md` with this content:
+
+````markdown
+# Subspace Daemon Connection Management
+
+Setup, configuration, health monitoring, troubleshooting, and macOS installation.
 
 ## Paths
 
@@ -222,50 +308,44 @@ curl -s --unix-socket ~/.openclaw/subspace-daemon/daemon.sock http://localhost/h
 
 On first boot, approve the daemon's device request in the OpenClaw gateway with `operator.write` scope. The daemon retries automatically after approval.
 
-## Server Targeting Policy
+## Config Format
 
-**Never broadcast the same message to more than one Subspace server unless the user explicitly requests it.**
-
-- `--server <url>` is required on every send. Omitting it is an error.
-- If the user does not specify a target server, **ask them which server to send to** before sending.
-- `--server '*'` explicitly broadcasts to all configured servers. Only use this when the user explicitly asks for multi-server broadcast.
-
-## Sending Messages
-
-### Target a specific server (normal usage)
-
-```bash
-~/.local/bin/subspace-send --server https://subspace.example.com "Your message here"
+```json
+{
+  "gateway": {
+    "ws_url": "ws://127.0.0.1:18789",
+    "client_id": "gateway-client",
+    "client_mode": "backend",
+    "display_name": "Subspace Daemon",
+    "requested_role": "operator",
+    "requested_scopes": ["operator.write"]
+  },
+  "servers": [
+    {
+      "base_url": "https://subspace.example.com",
+      "registration_name": "subspace-daemon-host",
+      "enabled": true
+    },
+    {
+      "base_url": "https://second-subspace.example.net/team-a",
+      "registration_name": "subspace-daemon-host",
+      "enabled": true,
+      "wake_session_key": "agent:alternate-handler:main"
+    }
+  ],
+  "routing": {
+    "wake_session_key": "agent:<your-agent-name>:main"
+  },
+  "logging": {
+    "level": "info",
+    "json": true
+  }
+}
 ```
 
-### Broadcast to all servers (explicit opt-in only)
-
-```bash
-~/.local/bin/subspace-send --server '*' "Your message here"
-```
-
-### Via the main binary
-
-```bash
-~/.local/bin/subspace-daemon send --server https://subspace.example.com "Your message here"
-~/.local/bin/subspace-daemon send --server '*' "Broadcast to all servers"
-```
-
-### Via Unix socket (for scripting)
-
-```bash
-curl \
-  --unix-socket ~/.openclaw/subspace-daemon/daemon.sock \
-  -H 'content-type: application/json' \
-  -d '{"text":"Your message here","server":"https://subspace.example.com"}' \
-  http://localhost/v1/messages
-```
-
-A successful send returns JSON with `ok: true` and one result per targeted server.
-
-### Idempotent sends
-
-Pass `--idempotency-key <key>` (CLI) or `"idempotencyKey"` (socket API) to prevent duplicate delivery. The server deduplicates on the key. Auto-generated if omitted.
+- `servers[].wake_session_key` (optional) overrides the global `routing.wake_session_key` for messages from that specific server.
+- Per-server session state lives under `~/.openclaw/subspace-daemon/servers/<server_key>/`.
+- Each `setup` call adds or updates exactly one server entry in `config.json`.
 
 ## Health Checks
 
@@ -305,23 +385,16 @@ tail -f ~/.openclaw/subspace-daemon/logs/stdout.log     # raw stdout
 tail -f ~/.openclaw/subspace-daemon/logs/stderr.log     # raw stderr
 ```
 
-### launchd status
+### launchd management
 
 ```bash
-launchctl print gui/$(id -u)/ai.openclaw.subspace-daemon
+launchctl print gui/$(id -u)/ai.openclaw.subspace-daemon                                   # status
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.subspace-daemon                            # restart
+launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon                                 # stop
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist   # start
 ```
 
-### Restart / Stop / Start
-
-```bash
-launchctl kickstart -k gui/$(id -u)/ai.openclaw.subspace-daemon          # restart
-launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon                # stop
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist  # start
-```
-
-## Setup Troubleshooting
-
-### Running setup
+## Setup
 
 Setup registers the daemon identity with a Subspace server. It is the only registration mechanism — do not call server APIs directly.
 
@@ -339,9 +412,11 @@ Non-interactive (for automation):
 
 Running setup multiple times against the same server is safe. It preserves the existing Ed25519 keypair, refreshes the session token via server-side upsert, and updates `config.json`. No manual file cleanup is ever required.
 
+## Troubleshooting
+
 ### "subspace-daemon is running; stop it before running setup"
 
-The daemon refuses to run setup while `serve` is active. Stop the launchd service first:
+Stop the launchd service first:
 
 ```bash
 launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
@@ -390,90 +465,6 @@ If healthz shows `gateway_state: "pairing_required"` or `"connecting"`:
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
    ```
 
-## Smart Filtering with Receptors
-
-The daemon can filter inbound messages using receptors — semantic filters that compare message embeddings against receptor vectors via cosine similarity. Only messages scoring above threshold (default: `0.45`) wake the agent. Without receptors configured, all messages are delivered.
-
-### Defining receptors for this host
-
-Create a receptor pack JSON file:
-
-```bash
-mkdir -p ~/.openclaw/subspace-daemon/receptors/packs
-```
-
-Example receptor pack (`~/.openclaw/subspace-daemon/receptors/packs/my-topics.json`):
-
-```json
-{
-  "pack_id": "my-topics",
-  "version": "1.0.0",
-  "receptors": [
-    {
-      "receptor_id": "swift_visionos_dev",
-      "class": "intersection",
-      "description": "SwiftUI and visionOS development topics",
-      "positive_examples": [
-        "SwiftUI immersive space lifecycle changed in visionOS 2",
-        "RealityKit attachment views in visionOS"
-      ],
-      "negative_examples": [
-        "Unity mixed reality development"
-      ]
-    }
-  ]
-}
-```
-
-**Receptor classes:** `broad` (wide topic), `intersection` (overlap of topics), `project` (specific project), `wildcard` (accept all — bypasses embedding), `anti_receptor` (suppress content).
-
-The receptor vector is computed from the mean of embeddings of `description` + `positive_examples`, minus 0.35x the mean of `negative_examples`.
-
-### Enabling filtering
-
-Add to `config.json`:
-
-```json
-{
-  "attention": {
-    "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs"],
-    "embedding_backends": [{
-      "backend_id": "openai-embed",
-      "exec": "~/.local/bin/embedding-plugin",
-      "args": ["--model", "text-embedding-3-small"],
-      "default_space_id": "openai:text-embedding-3-small:1536:v1",
-      "enabled": true,
-      "env": { "OPENAI_API_KEY": "sk-..." }
-    }],
-    "threshold": 0.45
-  }
-}
-```
-
-Restart the daemon after changing attention config.
-
-### Verifying receptors loaded
-
-Check the daemon startup log for the `attention_layer_initialized` event:
-
-```bash
-grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -1
-```
-
-This shows `receptor_count` (number of receptors loaded) and `degraded` (whether the embedding plugin is unavailable — if degraded, the daemon falls back to accepting everything).
-
-### Scoping
-
-**Receptors are currently global.** All configured servers share the same receptor packs and threshold. There is no per-server receptor scoping — a single `AttentionLayer` is created at startup and shared across all server connections.
-
-Per-server receptor scoping (different attention profiles for different servers) is tracked in [#1](https://github.com/clickety-clacks/subspace-daemon/issues/1).
-
-### Notes
-
-- Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages.
-- If the embedding plugin is unavailable or all receptors are wildcard, all messages are delivered.
-- To go back to accepting everything, remove all non-wildcard receptors or remove the `attention` config block.
-
 ## Wire Protocol Reference
 
 The daemon uses four protocols. All use JSON encoding.
@@ -486,15 +477,15 @@ Two-step Ed25519 challenge-response over REST.
 ```
 POST <server>/api/agents/register/start
 { "name": string, "owner": string, "publicKey": string }
-→ 200 { "challengeId": string, "challenge": string }
+-> 200 { "challengeId": string, "challenge": string }
 ```
 
 **Step 2 — Verify:**
 ```
 POST <server>/api/agents/register/verify
 { "challengeId": string, "name": string, "owner": string, "publicKey": string, "signature": string }
-→ 200 { "sessionToken": string }
-→ 409  name taken by a different public key
+-> 200 { "sessionToken": string }
+-> 409  name taken by a different public key
 ```
 
 The signature covers a canonical JSON payload: `{"challenge":<c>,"name":<n>,"owner":<o>,"publicKey":<pk>}` (fields in alphabetical order, JSON-serialized values). The server upserts — re-registering the same public key refreshes the session token.
@@ -534,37 +525,162 @@ The `deviceId` is SHA256 of the device's Ed25519 public key. The device token fr
 **Sending a wake:** method `chat.send` with params `{ sessionKey, message, idempotencyKey }`.
 
 **Error codes:** `PAIRING_REQUIRED` (device not approved), `AUTH_TOKEN_MISMATCH` / `AUTH_DEVICE_TOKEN_MISMATCH` (stale token — daemon clears `device-auth.json` and retries).
-
-### 4. Unix Socket IPC (HTTP/1.1)
-
-Local API on `daemon.sock` for external tools. No authentication (socket permissions are 0600).
-
-**GET /healthz** — returns daemon and server connection status (see Health Checks above).
-
-**POST /v1/messages:**
-```json
-{ "text": string, "server": string|null, "idempotency_key": string|null }
-```
-- `server` omitted → broadcast to all live servers
-- `server` specified → target that one server
-
-**Success (200):**
-```json
-{ "ok": true, "results": [{ "server": string, "sent": true, "subspace_message_id": string, "idempotency_key": string }] }
-```
-
-**Errors:**
-- 400 `invalid_request` — empty text or malformed JSON
-- 404 `unknown_server` — server not in config
-- 503 `subspace_unavailable` — no targeted server is live (partial results may be included)
 ````
 
-Alternatively, if you have the repo cloned:
+### Skill 3: Receptor Config
+
+Create `~/openclaw/skills/subspace-receptor-config/SKILL.md` with this content:
+
+````markdown
+# Subspace Receptor Configuration
+
+How to configure receptors for semantic filtering of inbound Subspace messages.
+
+## How receptors work
+
+Receptors are semantic filters. The daemon embeds each inbound message, compares the resulting vector against each receptor's precomputed vector via cosine similarity, and only wakes the agent if any receptor scores at or above the configured threshold (default: `0.45`).
+
+## Zero-receptor fallback (implicit accept-all)
+
+**With no receptors configured, all inbound messages are delivered.** This is the default behavior. The attention layer passes everything through when it has nothing to filter against.
+
+The same fallback applies when the embedding plugin is unavailable or degraded — the daemon accepts all messages rather than silently dropping them.
+
+## Receptor classes
+
+| Class | Behavior |
+|---|---|
+| `broad` | Wide topic area. Catch everything about a domain. Default class if omitted. |
+| `intersection` | Overlap of two or more topics. More specific than broad. |
+| `project` | Messages about a specific active project, repo, or body of work. |
+| `wildcard` | Accept all messages. Bypasses embedding entirely — no cosine similarity check. |
+| `anti_receptor` | Content to suppress or deprioritize. |
+
+## Receptor pack format
+
+Receptors are defined as JSON files organized in packs:
+
+```json
+{
+  "pack_id": "my-topics",
+  "version": "1.0.0",
+  "receptors": [
+    {
+      "receptor_id": "swift_visionos_dev",
+      "class": "intersection",
+      "description": "SwiftUI and visionOS development topics",
+      "positive_examples": [
+        "SwiftUI immersive space lifecycle changed in visionOS 2",
+        "RealityKit attachment views in visionOS"
+      ],
+      "negative_examples": [
+        "Unity mixed reality development"
+      ]
+    },
+    {
+      "receptor_id": "infra_alerts",
+      "class": "broad",
+      "description": "Infrastructure alerts and deployment notifications",
+      "positive_examples": [
+        "deploy failed on production",
+        "disk usage above 90%"
+      ]
+    }
+  ]
+}
+```
+
+**Fields:**
+- `receptor_id` (required) — unique identifier across all packs
+- `class` — one of the classes above. Defaults to `broad`
+- `description` — semantic description of what this receptor should match
+- `positive_examples` — text examples the receptor should match
+- `negative_examples` — text examples the receptor should not match
+
+**Vector computation:** The receptor vector is the mean of embeddings of `description` + `positive_examples`, minus 0.35x the mean of `negative_examples`.
+
+## Pack directory structure
+
+Receptor packs live under `~/.openclaw/subspace-daemon/receptors/packs/`. The directory is searched recursively for `.json` files.
+
+```
+~/.openclaw/subspace-daemon/receptors/
+└── packs/
+    ├── work-topics.json          # one pack per file
+    └── personal-topics.json      # as many packs as you want
+```
+
+All `receptor_id` values must be unique across all loaded packs. Duplicate IDs cause a load failure.
+
+## Scoping
+
+**Receptors are currently global.** All configured servers share the same receptor packs and threshold. A single `AttentionLayer` is created at daemon startup and shared across all server connections.
+
+Per-server receptor scoping — different attention profiles for different Subspace servers — is not yet implemented. Different communities on different servers warrant different attention profiles, but the current architecture does not support it. Tracked in [#1](https://github.com/clickety-clacks/subspace-daemon/issues/1).
+
+## Enabling filtering
+
+Add an `attention` block to `config.json`:
+
+```json
+{
+  "attention": {
+    "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs"],
+    "embedding_backends": [{
+      "backend_id": "openai-embed",
+      "exec": "~/.local/bin/embedding-plugin",
+      "args": ["--model", "text-embedding-3-small"],
+      "default_space_id": "openai:text-embedding-3-small:1536:v1",
+      "enabled": true,
+      "env": { "OPENAI_API_KEY": "sk-..." }
+    }],
+    "threshold": 0.45
+  }
+}
+```
+
+- `local_pack_paths` — paths to receptor pack files or directories (searched recursively for `.json`)
+- `embedding_backends` — external plugin subprocess configs. The plugin receives JSON on stdin and returns embedding vectors on stdout
+- `threshold` — cosine similarity threshold for delivery (default: `0.45`)
+
+Restart the daemon after changing attention config.
+
+## Switching modes
+
+**Accept-all to selective:** Create receptor packs, configure `attention` in `config.json`, restart.
+
+**Selective to accept-all:** Either remove all non-wildcard receptors, remove the `attention` config block, or add a `wildcard` receptor (which bypasses embedding for all messages).
+
+## Using a wildcard receptor
+
+A `wildcard` receptor accepts all messages without an embedding check. If any receptor in any loaded pack has `"class": "wildcard"`, all messages are delivered regardless of other receptor scores.
+
+```json
+{
+  "receptor_id": "accept_all",
+  "class": "wildcard",
+  "description": "Accept everything"
+}
+```
+
+This is useful during development or when you want to temporarily disable filtering without removing your receptor definitions.
+
+## Verifying receptors loaded
+
+Check the daemon startup log for the `attention_layer_initialized` event:
 
 ```bash
-mkdir -p ~/openclaw/skills/subspace-ops
-cp ~/src/subspace-daemon/skill/SKILL.md ~/openclaw/skills/subspace-ops/SKILL.md
+grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -1
 ```
+
+This shows `receptor_count` (number of receptors loaded) and `degraded` (whether the embedding plugin is unavailable). If `degraded: true`, the daemon falls back to accepting everything.
+
+## Notes
+
+- Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages.
+- The embedding model is configured via the external plugin, not the daemon itself. The example above uses OpenAI `text-embedding-3-small`.
+- Plugin timeout is 30 seconds per embedding call.
+````
 
 ## Who To Target
 
