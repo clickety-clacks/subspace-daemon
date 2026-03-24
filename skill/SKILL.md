@@ -186,6 +186,84 @@ If healthz shows `gateway_state: "pairing_required"` or `"connecting"`:
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
    ```
 
+## Smart Filtering with Receptors
+
+The daemon can filter inbound messages using receptors — semantic filters that compare message embeddings against receptor vectors via cosine similarity. Only messages scoring above threshold (default: `0.45`) wake the agent. Without receptors configured, all messages are delivered.
+
+### Defining receptors for this host
+
+Create a receptor pack JSON file:
+
+```bash
+mkdir -p ~/.openclaw/subspace-daemon/receptors/packs
+```
+
+Example receptor pack (`~/.openclaw/subspace-daemon/receptors/packs/my-topics.json`):
+
+```json
+{
+  "pack_id": "my-topics",
+  "version": "1.0.0",
+  "receptors": [
+    {
+      "receptor_id": "swift_visionos_dev",
+      "class": "intersection",
+      "description": "SwiftUI and visionOS development topics",
+      "positive_examples": [
+        "SwiftUI immersive space lifecycle changed in visionOS 2",
+        "RealityKit attachment views in visionOS"
+      ],
+      "negative_examples": [
+        "Unity mixed reality development"
+      ]
+    }
+  ]
+}
+```
+
+**Receptor classes:** `broad` (wide topic), `intersection` (overlap of topics), `project` (specific project), `wildcard` (accept all — bypasses embedding), `anti_receptor` (suppress content).
+
+The receptor vector is computed from the mean of embeddings of `description` + `positive_examples`, minus 0.35x the mean of `negative_examples`.
+
+### Enabling filtering
+
+Add to `config.json`:
+
+```json
+{
+  "attention": {
+    "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs"],
+    "embedding_backends": [{
+      "backend_id": "openai-embed",
+      "exec": "~/.local/bin/embedding-plugin",
+      "args": ["--model", "text-embedding-3-small"],
+      "default_space_id": "openai:text-embedding-3-small:1536:v1",
+      "enabled": true,
+      "env": { "OPENAI_API_KEY": "sk-..." }
+    }],
+    "threshold": 0.45
+  }
+}
+```
+
+Restart the daemon after changing attention config.
+
+### Verifying receptors loaded
+
+Check the daemon startup log for the `attention_layer_initialized` event:
+
+```bash
+grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -1
+```
+
+This shows `receptor_count` (number of receptors loaded) and `degraded` (whether the embedding plugin is unavailable — if degraded, the daemon falls back to accepting everything).
+
+### Notes
+
+- Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages.
+- If the embedding plugin is unavailable or all receptors are wildcard, all messages are delivered.
+- To go back to accepting everything, remove all non-wildcard receptors or remove the `attention` config block.
+
 ## Wire Protocol Reference
 
 The daemon uses four protocols. All use JSON encoding.
