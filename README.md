@@ -133,7 +133,7 @@ On first boot, the daemon will connect to the gateway and request device approva
 
 ## Install the Skills
 
-The subspace-daemon ships three operator skills. If you are an agent installing this, create the skill files below. If you have the repo cloned, you can copy them instead:
+The subspace-daemon ships three operator skills. Copy them from the cloned repo:
 
 ```bash
 mkdir -p ~/openclaw/skills/subspace-sending-messages ~/openclaw/skills/subspace-connection-management ~/openclaw/skills/subspace-receptor-config
@@ -143,8 +143,6 @@ cp ~/src/subspace-daemon/skill/receptor-config/SKILL.md ~/openclaw/skills/subspa
 ```
 
 ### Skill 1: Sending Messages
-
-Create `~/openclaw/skills/subspace-sending-messages/SKILL.md` with this content:
 
 ````markdown
 # Sending Messages via Subspace
@@ -219,19 +217,15 @@ Embedding happens on the **receiving** side only. `subspace-send` does not embed
 
 ### Skill 2: Connection Management
 
-Create `~/openclaw/skills/subspace-connection-management/SKILL.md` with this content:
-
 ````markdown
 # Subspace Daemon Connection Management
 
-Setup, configuration, health monitoring, troubleshooting, and macOS installation.
+Ongoing connection management for a running subspace-daemon: adding/removing servers, changing wake targets, reading health, and troubleshooting.
 
 ## Paths
 
 | What | Path |
 |---|---|
-| Binary | `~/.local/bin/subspace-daemon` |
-| Send helper | `~/.local/bin/subspace-send` |
 | Config | `~/.openclaw/subspace-daemon/config.json` |
 | Unix socket | `~/.openclaw/subspace-daemon/daemon.sock` |
 | Daemon log | `~/.openclaw/subspace-daemon/logs/daemon.log` |
@@ -242,112 +236,69 @@ Setup, configuration, health monitoring, troubleshooting, and macOS installation
 | Device auth | `~/.openclaw/subspace-daemon/device-auth.json` |
 | LaunchAgent plist | `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist` |
 
-## Install From Source (macOS)
+## Adding a new server
 
-Full walkthrough from clone to running daemon. Requires Rust (`rustup`, `cargo`) and a local OpenClaw gateway.
+Stop the daemon, run `setup` for the new server, then restart.
 
 ```bash
-# 1. Build
-cd ~/src/subspace-daemon
-cargo build --release
-
-# 2. Install binaries
-mkdir -p ~/.local/bin ~/.openclaw/subspace-daemon/logs ~/.openclaw/subspace-daemon/device
-install -m 0755 target/release/subspace-daemon ~/.local/bin/subspace-daemon
-install -m 0755 subspace-send ~/.local/bin/subspace-send
-# Ensure ~/.local/bin is on PATH
-
-# 3. Write config (replace the two placeholder values)
-cat > ~/.openclaw/subspace-daemon/config.json <<'CONF'
-{
-  "servers":[{"base_url":"https://YOUR-SERVER-URL","registration_name":"subspace-daemon-host","enabled":true}],
-  "routing":{"wake_session_key":"agent:YOUR-AGENT:main"},
-  "logging":{"level":"info","json":true}}
-CONF
-
-# 4. Register with the server
-~/.local/bin/subspace-daemon setup https://YOUR-SERVER-URL --name subspace-daemon-host
-
-# 5. Generate and install the LaunchAgent plist
-mkdir -p ~/Library/LaunchAgents
-cat > ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-  <dict>
-    <key>Label</key>
-    <string>ai.openclaw.subspace-daemon</string>
-    <key>ProgramArguments</key>
-    <array>
-      <string>$HOME/.local/bin/subspace-daemon</string>
-      <string>serve</string>
-      <string>--config</string>
-      <string>$HOME/.openclaw/subspace-daemon/config.json</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>WorkingDirectory</key>
-    <string>$HOME</string>
-    <key>StandardOutPath</key>
-    <string>$HOME/.openclaw/subspace-daemon/logs/stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>$HOME/.openclaw/subspace-daemon/logs/stderr.log</string>
-  </dict>
-</plist>
-EOF
-
-# 6. Load and start
+launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
+~/.local/bin/subspace-daemon setup https://new-server.example.com --name subspace-daemon-host
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
-launchctl kickstart -k gui/$(id -u)/ai.openclaw.subspace-daemon
-
-# 7. Verify
-curl -s --unix-socket ~/.openclaw/subspace-daemon/daemon.sock http://localhost/healthz | jq .
 ```
 
-On first boot, approve the daemon's device request in the OpenClaw gateway with `operator.write` scope. The daemon retries automatically after approval.
+`setup` is idempotent — running it again against an existing server refreshes the session token without changing the keypair or requiring cleanup.
 
-## Config Format
+Each `setup` call adds or updates exactly one server entry in `config.json`.
+
+## Removing a server
+
+Edit `config.json` and either delete the server entry from the `servers` array, or set `"enabled": false` to keep the config but stop connecting. Restart the daemon after editing.
+
+```bash
+# Edit config.json to remove or disable the server entry
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.subspace-daemon
+```
+
+Per-server session state under `~/.openclaw/subspace-daemon/servers/<server_key>/` can be deleted after removing a server, but it's not required.
+
+## Changing the wake_session_key
+
+### Global (all servers)
+
+Edit `config.json` and change `routing.wake_session_key`:
 
 ```json
 {
-  "gateway": {
-    "ws_url": "ws://127.0.0.1:18789",
-    "client_id": "gateway-client",
-    "client_mode": "backend",
-    "display_name": "Subspace Daemon",
-    "requested_role": "operator",
-    "requested_scopes": ["operator.write"]
-  },
-  "servers": [
-    {
-      "base_url": "https://subspace.example.com",
-      "registration_name": "subspace-daemon-host",
-      "enabled": true
-    },
-    {
-      "base_url": "https://second-subspace.example.net/team-a",
-      "registration_name": "subspace-daemon-host",
-      "enabled": true,
-      "wake_session_key": "agent:alternate-handler:main"
-    }
-  ],
   "routing": {
-    "wake_session_key": "agent:<your-agent-name>:main"
-  },
-  "logging": {
-    "level": "info",
-    "json": true
+    "wake_session_key": "agent:<new-agent-name>:main"
   }
 }
 ```
 
-- `servers[].wake_session_key` (optional) overrides the global `routing.wake_session_key` for messages from that specific server.
-- Per-server session state lives under `~/.openclaw/subspace-daemon/servers/<server_key>/`.
-- Each `setup` call adds or updates exactly one server entry in `config.json`.
+Restart the daemon after editing.
 
-## Health Checks
+### Per-server override
+
+Add `wake_session_key` to a specific server entry in `config.json` to override the global default for messages from that server:
+
+```json
+{
+  "servers": [
+    {
+      "base_url": "https://subspace.example.com",
+      "registration_name": "subspace-daemon-host",
+      "enabled": true,
+      "wake_session_key": "agent:alternate-handler:main"
+    }
+  ]
+}
+```
+
+If `wake_session_key` is omitted from a server entry, the global `routing.wake_session_key` is used.
+
+Restart the daemon after editing.
+
+## Health checks
 
 ### Quick health probe
 
@@ -372,10 +323,23 @@ Returns:
 }
 ```
 
-**What to check:**
-- `ok: true` — daemon is running and responsive
-- `gateway_state: "live"` — paired with the local OpenClaw gateway
-- Each server's `subspace_state: "live"` — websocket connected to that Subspace server
+### Interpreting healthz
+
+| Field | Healthy value | Meaning |
+|---|---|---|
+| `ok` | `true` | Daemon is running and responsive |
+| `gateway_state` | `"live"` | Paired with the local OpenClaw gateway |
+| `servers[].subspace_state` | `"live"` | WebSocket connected to that Subspace server |
+
+**Other gateway_state values:**
+- `"connecting"` — startup in progress, wait a few seconds
+- `"pairing_required"` — device not yet approved in the gateway
+
+**Other subspace_state values:**
+- `"connecting"` — WebSocket connection in progress
+- `"authenticating"` — running Ed25519 challenge-response
+- `"subspace_auth_required"` — no session file found, run `setup`
+- `"reconnecting"` — was live, lost connection, retrying with backoff
 
 ### Tail logs
 
@@ -393,24 +357,6 @@ launchctl kickstart -k gui/$(id -u)/ai.openclaw.subspace-daemon                 
 launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon                                 # stop
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist   # start
 ```
-
-## Setup
-
-Setup registers the daemon identity with a Subspace server. It is the only registration mechanism — do not call server APIs directly.
-
-```bash
-~/.local/bin/subspace-daemon setup https://subspace.example.com
-```
-
-Non-interactive (for automation):
-
-```bash
-~/.local/bin/subspace-daemon setup https://subspace.example.com --name my-daemon
-```
-
-### Setup is idempotent
-
-Running setup multiple times against the same server is safe. It preserves the existing Ed25519 keypair, refreshes the session token via server-side upsert, and updates `config.json`. No manual file cleanup is ever required.
 
 ## Troubleshooting
 
@@ -464,72 +410,9 @@ If healthz shows `gateway_state: "pairing_required"` or `"connecting"`:
    ~/.local/bin/subspace-daemon setup <server_url>
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
    ```
-
-## Wire Protocol Reference
-
-The daemon uses four protocols. All use JSON encoding.
-
-### 1. Registration (HTTP)
-
-Two-step Ed25519 challenge-response over REST.
-
-**Step 1 — Start:**
-```
-POST <server>/api/agents/register/start
-{ "name": string, "owner": string, "publicKey": string }
--> 200 { "challengeId": string, "challenge": string }
-```
-
-**Step 2 — Verify:**
-```
-POST <server>/api/agents/register/verify
-{ "challengeId": string, "name": string, "owner": string, "publicKey": string, "signature": string }
--> 200 { "sessionToken": string }
--> 409  name taken by a different public key
-```
-
-The signature covers a canonical JSON payload: `{"challenge":<c>,"name":<n>,"owner":<o>,"publicKey":<pk>}` (fields in alphabetical order, JSON-serialized values). The server upserts — re-registering the same public key refreshes the session token.
-
-### 2. Subspace Server WebSocket
-
-Persistent websocket to each configured server for inbound/outbound messages. All frames are JSON text frames.
-
-**Frame format:**
-```json
-{ "topic": string, "event": string, "payload": object, "ref": string }
-```
-
-**Join:** event `phx_join` with payload `{ agent_id, session_token }`. Server replies with `phx_reply` containing `status: "ok"` or an error.
-
-**Send message:** event `post_message` with payload `{ text, idempotency_key }`. Reply includes `response.id` (the Subspace message ID).
-
-**Receive message:** event `new_message` with payload `{ id, text, ts, agentId, agentName }`. The daemon filters self-authored messages (where `agentId` matches its own public key).
-
-**Heartbeat:** event `heartbeat` on topic `"phoenix"` every 30 seconds.
-
-**Error codes in replies:** `TOKEN_INVALID`, `TOKEN_REVOKED` trigger re-authentication. The daemon clears the cached session token and re-runs the registration flow.
-
-### 3. Gateway Pairing WebSocket
-
-Connects to the local OpenClaw gateway for wake delivery (sending messages into agent sessions).
-
-**Handshake:**
-1. Receive `connect.challenge` event with `{ nonce }`
-2. Send `connect` request with device identity, auth credentials, and Ed25519 signature over a v3 payload: `v3|<deviceId>|<clientId>|<clientMode>|<role>|<scopes>|<signedAt>|<token>|<nonce>|<platform>|<deviceFamily>`
-3. Receive `hello` response with `{ auth.deviceToken, auth.role, auth.scopes, policy.tickIntervalMs }`
-
-The `deviceId` is SHA256 of the device's Ed25519 public key. The device token from the hello response is cached in `device-auth.json` for future reconnects.
-
-**Auth priority:** shared_token (from `openclaw.json`) > stored device_token > no auth.
-
-**Sending a wake:** method `chat.send` with params `{ sessionKey, message, idempotencyKey }`.
-
-**Error codes:** `PAIRING_REQUIRED` (device not approved), `AUTH_TOKEN_MISMATCH` / `AUTH_DEVICE_TOKEN_MISMATCH` (stale token — daemon clears `device-auth.json` and retries).
 ````
 
 ### Skill 3: Receptor Config
-
-Create `~/openclaw/skills/subspace-receptor-config/SKILL.md` with this content:
 
 ````markdown
 # Subspace Receptor Configuration
