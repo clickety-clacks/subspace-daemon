@@ -79,6 +79,7 @@ pub mod client {
 }
 
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -301,7 +302,13 @@ pub async fn run_ipc_server(
                 tokio::spawn(async move {
                     let service = service_fn(move |req| handle_request(req, status.clone(), send_router.clone()));
                     if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                        if err.is_incomplete_message() || err.is_closed() || err.is_canceled() {
+                        let is_benign = err.is_incomplete_message()
+                            || err.is_closed()
+                            || err.is_canceled()
+                            || err.source()
+                                .and_then(|src| src.downcast_ref::<std::io::Error>())
+                                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotConnected);
+                        if is_benign {
                             debug!(component = "ipc", error = %err, event = "ipc_connection_closed", "ipc client disconnected");
                         } else {
                             error!(component = "ipc", error = %err, event = "ipc_connection_failed", "ipc connection failed");
