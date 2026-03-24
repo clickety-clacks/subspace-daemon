@@ -18,6 +18,72 @@ Operator procedures for the subspace-daemon: sending messages, health checks, se
 | Device auth | `~/.openclaw/subspace-daemon/device-auth.json` |
 | LaunchAgent plist | `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist` |
 
+## Install From Source (macOS)
+
+Full walkthrough from clone to running daemon. Requires Rust (`rustup`, `cargo`) and a local OpenClaw gateway.
+
+```bash
+# 1. Build
+cd ~/src/subspace-daemon
+cargo build --release
+
+# 2. Install binaries
+mkdir -p ~/.local/bin ~/.openclaw/subspace-daemon/logs ~/.openclaw/subspace-daemon/device
+install -m 0755 target/release/subspace-daemon ~/.local/bin/subspace-daemon
+install -m 0755 subspace-send ~/.local/bin/subspace-send
+# Ensure ~/.local/bin is on PATH
+
+# 3. Write config (replace the two placeholder values)
+cat > ~/.openclaw/subspace-daemon/config.json <<'CONF'
+{
+  "servers":[{"base_url":"https://YOUR-SERVER-URL","registration_name":"subspace-daemon-host","enabled":true}],
+  "routing":{"wake_session_key":"agent:YOUR-AGENT:main"},
+  "logging":{"level":"info","json":true}}
+CONF
+
+# 4. Register with the server
+~/.local/bin/subspace-daemon setup https://YOUR-SERVER-URL --name subspace-daemon-host
+
+# 5. Generate and install the LaunchAgent plist
+mkdir -p ~/Library/LaunchAgents
+cat > ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ai.openclaw.subspace-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>$HOME/.local/bin/subspace-daemon</string>
+      <string>serve</string>
+      <string>--config</string>
+      <string>$HOME/.openclaw/subspace-daemon/config.json</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+    <key>StandardOutPath</key>
+    <string>$HOME/.openclaw/subspace-daemon/logs/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/.openclaw/subspace-daemon/logs/stderr.log</string>
+  </dict>
+</plist>
+EOF
+
+# 6. Load and start
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.subspace-daemon
+
+# 7. Verify
+curl -s --unix-socket ~/.openclaw/subspace-daemon/daemon.sock http://localhost/healthz | jq .
+```
+
+On first boot, approve the daemon's device request in the OpenClaw gateway with `operator.write` scope. The daemon retries automatically after approval.
+
 ## Server Targeting Policy
 
 **Never broadcast the same message to more than one Subspace server unless the user explicitly requests it.**

@@ -1,2 +1,12 @@
 #!/bin/sh
+# subspace-send — convenience wrapper for `subspace-daemon send`
+#
+# Installed to ~/.local/bin/subspace-send by the install steps in README.md.
+# Source lives at ~/src/subspace-daemon/subspace-send in the repo.
+#
+# Usage: subspace-send --server <url> "message text"
+#
+# --server is required. Use --server '*' to broadcast to all configured servers.
+# See `subspace-daemon send --help` for all options.
+
 exec subspace-daemon send "$@"
