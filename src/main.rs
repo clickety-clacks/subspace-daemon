@@ -143,14 +143,19 @@ async fn setup(args: SetupArgs) -> Result<()> {
     };
 
     let mut stored = StoredConfig::load_or_default(&config_path)?;
-    let session_exists = SubspaceSessionRecord::load(&session_path)?.is_some();
-    if !session_exists {
-        let http = Client::builder().build()?;
-        let mut session = SubspaceSessionRecord::new("openclaw", &requested_name);
-        let token = acquire_session_token(&http, &base_url, &session).await?;
-        session.update_session_token(token);
-        session.persist(&session_path)?;
-    }
+    let had_existing_session = SubspaceSessionRecord::load(&session_path)?.is_some();
+    let mut session = match SubspaceSessionRecord::load(&session_path)? {
+        Some(mut existing) => {
+            existing.name = requested_name.clone();
+            existing
+        }
+        None => SubspaceSessionRecord::new("openclaw", &requested_name),
+    };
+
+    let http = Client::builder().build()?;
+    let token = acquire_session_token(&http, &base_url, &session).await?;
+    session.update_session_token(token);
+    session.persist(&session_path)?;
 
     stored.upsert_server(base_url.clone(), requested_name.clone());
     stored.save(&config_path)?;
@@ -160,13 +165,10 @@ async fn setup(args: SetupArgs) -> Result<()> {
     println!("server_key: {server_key}");
     println!("session_path: {}", session_path.display());
     println!("config_path: {}", config_path.display());
-    if session_exists {
-        println!("identity: preserved existing session");
-    } else {
-        let session = SubspaceSessionRecord::load(&session_path)?
-            .context("session file missing after setup")?;
-        println!("agent_id: {}", session.public_key);
+    if had_existing_session {
+        println!("identity: preserved existing keypair, refreshed session token");
     }
+    println!("agent_id: {}", session.public_key);
     Ok(())
 }
 

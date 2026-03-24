@@ -53,48 +53,10 @@ pub async fn acquire_session_token(
     let status = verify.status();
     let verify_json: Value = verify.json().await.unwrap_or_else(|_| json!({}));
     match status.as_u16() {
-        201 | 200 => read_string(&verify_json, "sessionToken"),
-        409 => reauth(client, base_url, record).await,
+        200 | 201 => read_string(&verify_json, "sessionToken"),
+        409 => bail!("name {:?} is already registered by a different agent on this server", record.name),
         _ => bail!("register_verify failed with status {}", status.as_u16()),
     }
-}
-
-async fn reauth(client: &Client, base_url: &str, record: &SubspaceSessionRecord) -> Result<String> {
-    let start = client
-        .post(format!("{base_url}/api/agents/reauth/start"))
-        .json(&json!({ "agentId": record.public_key }))
-        .send()
-        .await
-        .context("subspace reauth/start failed")?;
-    let start_status = start.status();
-    let start_json: Value = start.json().await.unwrap_or_else(|_| json!({}));
-    if !start_status.is_success() {
-        bail!("reauth_start failed with status {}", start_status.as_u16());
-    }
-    let challenge = read_string(&start_json, "challenge")?;
-    let challenge_id = read_string(&start_json, "challengeId")?;
-    let canonical_payload = format!(
-        "{{\"agentId\":{},\"challenge\":{}}}",
-        serde_json::to_string(&record.public_key)?,
-        serde_json::to_string(&challenge)?,
-    );
-    let signature = record.sign_canonical_payload(&canonical_payload);
-    let verify = client
-        .post(format!("{base_url}/api/agents/reauth/verify"))
-        .json(&json!({
-            "challengeId": challenge_id,
-            "agentId": record.public_key,
-            "signature": signature,
-        }))
-        .send()
-        .await
-        .context("subspace reauth/verify failed")?;
-    let status = verify.status();
-    let verify_json: Value = verify.json().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        bail!("reauth_verify failed with status {}", status.as_u16());
-    }
-    read_string(&verify_json, "sessionToken")
 }
 
 fn read_string(json: &Value, key: &str) -> Result<String> {
