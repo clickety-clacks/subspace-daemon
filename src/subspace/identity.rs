@@ -68,14 +68,7 @@ impl NamedIdentityRecord {
         if trimmed.is_empty() {
             bail!("identity name must not be empty");
         }
-        if trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-        {
-            Ok(trimmed.to_string())
-        } else {
-            bail!("identity name must be lowercase alphanumeric plus hyphens");
-        }
+        Ok(trimmed.to_string())
     }
 
     pub fn load(path: &Path) -> Result<Option<Self>> {
@@ -148,13 +141,7 @@ impl NamedIdentityRecord {
             public_key: self.public_key.clone(),
             private_key: URL_SAFE_NO_PAD.encode(self.signing_key.to_bytes()),
         };
-        write_json_atomic(path, &file)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        write_json_atomic(path, &file)
     }
 
     pub fn load_or_create_from_legacy(
@@ -292,8 +279,11 @@ mod tests {
     #[test]
     fn validates_identity_name() {
         assert!(NamedIdentityRecord::validate_name("heimdal-1").is_ok());
-        assert!(NamedIdentityRecord::validate_name("Heimdal").is_err());
-        assert!(NamedIdentityRecord::validate_name("heimdal/main").is_err());
+        assert_eq!(
+            NamedIdentityRecord::validate_name(" Heimdal/main ").unwrap(),
+            "Heimdal/main"
+        );
+        assert!(NamedIdentityRecord::validate_name("   ").is_err());
     }
 
     #[test]

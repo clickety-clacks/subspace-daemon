@@ -570,7 +570,6 @@ fn parse_message_embeddings(payload: &Value) -> Vec<MessageEmbedding> {
         .filter_map(|value| {
             let space_id = value
                 .get("space_id")
-                .or_else(|| value.get("spaceId"))
                 .and_then(Value::as_str)?
                 .trim()
                 .to_string();
