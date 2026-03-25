@@ -6,6 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -210,6 +211,32 @@ impl SubspaceSessionRecord {
 }
 
 impl LegacySubspaceSessionRecord {
+    pub fn sign_canonical_payload(&self, payload: &str) -> String {
+        use ed25519_dalek::Signer;
+        URL_SAFE_NO_PAD.encode(self.signing_key.sign(payload.as_bytes()).to_bytes())
+    }
+
+    pub fn clear_session_token(&mut self) {
+        self.session_token = None;
+    }
+
+    pub fn update_session_token(&mut self, token: String) {
+        self.session_token = Some(token);
+    }
+
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        let private_key = self.signing_key.to_pkcs8_der()?;
+        let file = LegacySessionFile {
+            version: 1,
+            public_key: self.agent_id.clone(),
+            private_key: URL_SAFE_NO_PAD.encode(private_key.as_bytes()),
+            owner: DEFAULT_SUBSPACE_OWNER.to_string(),
+            name: self.registration_name.clone(),
+            session_token: self.session_token.clone(),
+        };
+        write_json_atomic(path, &file)
+    }
+
     pub fn migrate_to_identity(
         &self,
         identity: &NamedIdentityRecord,
@@ -294,6 +321,38 @@ mod tests {
             LoadedSessionRecord::Legacy(session) => {
                 assert_eq!(session.registration_name, "heimdal");
                 assert_eq!(session.session_token.as_deref(), Some("token"));
+            }
+        }
+    }
+
+    #[test]
+    fn persists_legacy_session_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("subspace-session.json");
+        let legacy = LegacySubspaceSessionRecord {
+            agent_id: "agent".to_string(),
+            registration_name: "heimdal".to_string(),
+            session_token: Some("token".to_string()),
+            signing_key: SigningKey::generate(&mut OsRng),
+        };
+        legacy.persist(&path).unwrap();
+
+        let loaded = load_session_record(&path).unwrap().unwrap();
+        match loaded {
+            LoadedSessionRecord::Current(_) => panic!("expected legacy session"),
+            LoadedSessionRecord::Legacy(mut session) => {
+                assert_eq!(session.registration_name, "heimdal");
+                assert_eq!(session.session_token.as_deref(), Some("token"));
+                session.clear_session_token();
+                session.persist(&path).unwrap();
+            }
+        }
+
+        let reloaded = load_session_record(&path).unwrap().unwrap();
+        match reloaded {
+            LoadedSessionRecord::Current(_) => panic!("expected legacy session"),
+            LoadedSessionRecord::Legacy(session) => {
+                assert_eq!(session.session_token, None);
             }
         }
     }

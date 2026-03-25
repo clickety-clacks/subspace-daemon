@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 
 use crate::subspace::identity::{
-    DEFAULT_SUBSPACE_OWNER, NamedIdentityRecord, SubspaceSessionRecord,
+    DEFAULT_SUBSPACE_OWNER, LegacySubspaceSessionRecord, NamedIdentityRecord, SubspaceSessionRecord,
 };
 
 pub async fn register_identity(
@@ -92,6 +92,51 @@ pub async fn reauth_identity(
         serde_json::to_string(&challenge)?,
     );
     let signature = identity.sign_canonical_payload(&canonical_payload);
+
+    let verify = client
+        .post(format!("{base_url}/api/agents/reauth/verify"))
+        .json(&json!({
+            "challengeId": challenge_id,
+            "agentId": session.agent_id,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .context("subspace reauth/verify failed")?;
+    let status = verify.status();
+    let verify_json: Value = verify.json().await.unwrap_or_else(|_| json!({}));
+    match status.as_u16() {
+        200 | 201 => read_string(&verify_json, "sessionToken"),
+        _ => bail!("reauth_verify failed with status {}", status.as_u16()),
+    }
+}
+
+pub async fn reauth_legacy_identity(
+    client: &Client,
+    base_url: &str,
+    session: &LegacySubspaceSessionRecord,
+) -> Result<String> {
+    let start = client
+        .post(format!("{base_url}/api/agents/reauth/start"))
+        .json(&json!({
+            "agentId": session.agent_id,
+        }))
+        .send()
+        .await
+        .context("subspace reauth/start failed")?;
+    let start_status = start.status();
+    let start_json: Value = start.json().await.unwrap_or_else(|_| json!({}));
+    if !start_status.is_success() {
+        bail!("reauth_start failed with status {}", start_status.as_u16());
+    }
+    let challenge = read_string(&start_json, "challenge")?;
+    let challenge_id = read_string(&start_json, "challengeId")?;
+    let canonical_payload = format!(
+        "{{\"agentId\":{},\"challenge\":{}}}",
+        serde_json::to_string(&session.agent_id)?,
+        serde_json::to_string(&challenge)?,
+    );
+    let signature = session.sign_canonical_payload(&canonical_payload);
 
     let verify = client
         .post(format!("{base_url}/api/agents/reauth/verify"))

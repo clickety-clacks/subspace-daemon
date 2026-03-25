@@ -7,7 +7,9 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::attention::{AttentionLayer, AttentionResult, MessageEmbedding, format_attention_annotation};
+use crate::attention::{
+    AttentionLayer, AttentionResult, MessageEmbedding, format_attention_annotation,
+};
 use crate::config::{Config, RetryConfig};
 use crate::gateway::client::{GatewayClientHandle, start_gateway_client};
 use crate::ipc::{SendRouter, run_ipc_server};

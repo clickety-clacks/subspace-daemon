@@ -177,7 +177,10 @@ fn validate_registration_name(name: String) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn existing_setup_registration_name(config_path: &PathBuf, base_url: &str) -> Result<Option<String>> {
+fn existing_setup_registration_name(
+    config_path: &PathBuf,
+    base_url: &str,
+) -> Result<Option<String>> {
     let stored = StoredConfig::load_or_default(config_path)?;
     if let Some(name) = stored
         .servers

@@ -17,9 +17,10 @@ use crate::attention::{MessageEmbedding, OutboundEmbeddingRequest, compose_outbo
 use crate::config::{ReplayConfig, RetryConfig, ServerConfig};
 use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
-use crate::subspace::auth::reauth_identity;
+use crate::subspace::auth::{reauth_identity, reauth_legacy_identity};
 use crate::subspace::identity::{
-    LoadedSessionRecord, NamedIdentityRecord, SubspaceSessionRecord, load_session_record,
+    LegacySubspaceSessionRecord, LoadedSessionRecord, NamedIdentityRecord, SubspaceSessionRecord,
+    load_session_record,
 };
 use crate::supervisor::{DaemonStatus, WakeEnvelope};
 
@@ -67,9 +68,69 @@ impl ServerHandle {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_handle() -> ServerHandle {
+    let (tx, _rx) = mpsc::channel(1);
+    ServerHandle { tx }
+}
+
 struct PendingSend {
     reply: oneshot::Sender<Result<OutboundSendResult>>,
     idempotency_key: String,
+}
+
+enum ActiveSession {
+    Current {
+        session: SubspaceSessionRecord,
+        identity: NamedIdentityRecord,
+    },
+    Legacy(LegacySubspaceSessionRecord),
+}
+
+impl ActiveSession {
+    fn agent_id(&self) -> &str {
+        match self {
+            Self::Current { session, .. } => &session.agent_id,
+            Self::Legacy(session) => &session.agent_id,
+        }
+    }
+
+    fn session_token(&self) -> Option<&str> {
+        match self {
+            Self::Current { session, .. } => session.session_token.as_deref(),
+            Self::Legacy(session) => session.session_token.as_deref(),
+        }
+    }
+
+    fn clear_session_token(&mut self) {
+        match self {
+            Self::Current { session, .. } => session.clear_session_token(),
+            Self::Legacy(session) => session.clear_session_token(),
+        }
+    }
+
+    fn update_session_token(&mut self, token: String) {
+        match self {
+            Self::Current { session, .. } => session.update_session_token(token),
+            Self::Legacy(session) => session.update_session_token(token),
+        }
+    }
+
+    fn persist(&self, path: &std::path::Path) -> Result<()> {
+        match self {
+            Self::Current { session, .. } => session.persist(path),
+            Self::Legacy(session) => session.persist(path),
+        }
+    }
+
+    async fn reauth(&self, client: &Client, base_url: &str) -> Result<String> {
+        match self {
+            Self::Current { session, identity } => {
+                reauth_identity(client, base_url, session, identity).await
+            }
+            Self::Legacy(session) => reauth_legacy_identity(client, base_url, session).await,
+        }
+    }
 }
 
 pub async fn start_server_manager(
@@ -127,22 +188,22 @@ async fn run_server_manager(
 
     loop {
         let mut session = match load_session_record(&server.session_path)? {
-            Some(LoadedSessionRecord::Current(session)) => session,
-            Some(LoadedSessionRecord::Legacy(_)) => {
-                update_server_state(&status, &server, "subspace_auth_required").await;
+            Some(LoadedSessionRecord::Current(session)) => {
+                let identity_path = identities_dir.join(format!("{}.json", session.identity));
+                let identity = NamedIdentityRecord::load(&identity_path)?
+                    .ok_or_else(|| anyhow!("missing identity file: {}", identity_path.display()))?;
+                identity.ensure_matches_agent_id(&session.agent_id)?;
+                ActiveSession::Current { session, identity }
+            }
+            Some(LoadedSessionRecord::Legacy(session)) => {
                 warn!(
                     component = "subspace",
-                    event = "legacy_session_migration_required",
+                    event = "legacy_session_runtime_fallback",
                     server = %server.base_url,
                     server_key = %server.server_key,
-                    "legacy session format requires migration via `subspace-daemon setup <url> --identity <name>`"
+                    "using legacy inline-keypair session at runtime; migrate via `subspace-daemon setup <url> --identity <name>`"
                 );
-                tokio::select! {
-                    _ = shutdown.recv() => return Ok(()),
-                    _ = tokio::time::sleep(Duration::from_millis(jitter(backoff, retry.jitter_ratio))) => {}
-                }
-                backoff = (backoff.saturating_mul(2)).min(retry.max_ms);
-                continue;
+                ActiveSession::Legacy(session)
             }
             None => {
                 update_server_state(&status, &server, "subspace_auth_required").await;
@@ -154,15 +215,11 @@ async fn run_server_manager(
                 continue;
             }
         };
-        let identity_path = identities_dir.join(format!("{}.json", session.identity));
-        let identity = NamedIdentityRecord::load(&identity_path)?
-            .ok_or_else(|| anyhow!("missing identity file: {}", identity_path.display()))?;
-        identity.ensure_matches_agent_id(&session.agent_id)?;
 
-        if session.session_token.is_none() {
+        if session.session_token().is_none() {
             update_server_state(&status, &server, "authenticating").await;
             info!(component = "subspace", event = "subspace_connecting", server = %server.base_url, server_key = %server.server_key, phase = "auth", "authenticating to subspace");
-            match reauth_identity(&http, &server.base_url, &session, &identity).await {
+            match session.reauth(&http, &server.base_url).await {
                 Ok(token) => {
                     session.update_session_token(token);
                     session.persist(&server.session_path)?;
@@ -213,7 +270,7 @@ async fn connect_once(
     _retry: &RetryConfig,
     status: &Arc<RwLock<DaemonStatus>>,
     runtime: &Arc<Mutex<RuntimeStore>>,
-    session: &mut SubspaceSessionRecord,
+    session: &mut ActiveSession,
     generated_embedding_clients: &BTreeMap<
         String,
         crate::attention::embedding_plugin::EmbeddingPluginClient,
@@ -233,11 +290,11 @@ async fn connect_once(
     write
         .send(Message::Text(
             serde_json::to_string(&json!({
-                "topic": "firehose",
-                "event": "phx_join",
-                "payload": {
-                    "agent_id": session.agent_id,
-                    "session_token": session.session_token.clone().unwrap_or_default(),
+                    "topic": "firehose",
+                    "event": "phx_join",
+                    "payload": {
+                    "agent_id": session.agent_id(),
+                    "session_token": session.session_token().unwrap_or_default(),
                 },
                 "ref": join_ref,
             }))?
@@ -377,7 +434,7 @@ async fn connect_once(
                     "new_message" | "replay_message" => {
                         let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
                         let author_id = payload.get("agentId").and_then(Value::as_str).unwrap_or("").to_string();
-                        if author_id == session.agent_id {
+                        if author_id == session.agent_id() {
                             continue;
                         }
                         let message_id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_string();

@@ -427,7 +427,6 @@ impl AttentionLayer {
     pub fn is_degraded(&self) -> bool {
         self.degraded
     }
-
 }
 
 pub fn validate_generated_spaces(requested_spaces: &[String]) -> Result<()> {
@@ -755,6 +754,21 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].vector, vec![2.0]);
+    }
+
+    #[tokio::test]
+    async fn missing_generated_backend_does_not_block_plaintext_send() {
+        let embeddings = compose_outbound_embeddings(
+            "plaintext still sends",
+            &OutboundEmbeddingRequest {
+                generate_for_spaces: vec![OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID.to_string()],
+                ..OutboundEmbeddingRequest::default()
+            },
+            &BTreeMap::new(),
+        )
+        .await;
+
+        assert!(embeddings.is_empty());
     }
 
     #[test]

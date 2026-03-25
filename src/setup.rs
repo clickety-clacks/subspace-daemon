@@ -268,3 +268,154 @@ fn resolve_registration_name(
     }
     Ok(resolved)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attention::AttentionConfig;
+    use crate::config::{StoredServerConfig, default_config_path};
+    use crate::subspace::client::test_handle;
+    use crate::subspace::identity::NamedIdentityRecord;
+    use serde_json::json;
+    use std::env;
+    use std::fs;
+    use std::sync::{LazyLock, Mutex as StdMutex};
+    use tempfile::tempdir;
+
+    static HOME_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let original = env::var_os("HOME");
+            unsafe {
+                env::set_var("HOME", path);
+            }
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.take() {
+                unsafe {
+                    env::set_var("HOME", value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var("HOME");
+                }
+            }
+        }
+    }
+
+    fn write_current_server_state(
+        base_url: &str,
+        registration_name: &str,
+        identity_name: &str,
+    ) -> Result<(crate::config::AppPaths, NamedIdentityRecord)> {
+        let config_path = default_config_path();
+        let paths = derive_app_paths(config_path.clone(), None)?;
+        let server_key = derive_server_key(base_url)?;
+        let server_dir = paths.root.join("servers").join(server_key);
+        fs::create_dir_all(&server_dir)?;
+        let identity = NamedIdentityRecord::load_or_create(&paths.identities_dir, identity_name)?;
+        fs::write(
+            &paths.config_path,
+            serde_json::to_vec_pretty(&StoredConfig {
+                servers: vec![StoredServerConfig {
+                    base_url: base_url.to_string(),
+                    registration_name: Some(registration_name.to_string()),
+                    identity: Some(identity_name.to_string()),
+                    local_pack_paths: None,
+                    enabled: Some(true),
+                    wake_session_key: None,
+                }],
+                ..StoredConfig::default()
+            })?,
+        )?;
+        fs::write(
+            server_dir.join("subspace-session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "identity": identity_name,
+                "agent_id": identity.public_key,
+                "session_token": "token"
+            }))?,
+        )?;
+        Ok((paths, identity))
+    }
+
+    #[tokio::test]
+    async fn perform_setup_live_mutates_only_targeted_server_config() {
+        let _home_lock = HOME_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let _home_guard = HomeGuard::set(temp.path());
+        let base_url = "https://subspace.example.com";
+        let (paths, identity) =
+            write_current_server_state(base_url, "heimdal-old", "heimdal").unwrap();
+
+        let status = Arc::new(RwLock::new(DaemonStatus {
+            gateway_state: "live".to_string(),
+            wake_session_key: "agent:heimdal:main".to_string(),
+            servers: BTreeMap::from([(
+                base_url.to_string(),
+                crate::supervisor::ServerHealth {
+                    server: base_url.to_string(),
+                    server_key: derive_server_key(base_url).unwrap(),
+                    subspace_state: "live".to_string(),
+                },
+            )]),
+        }));
+        let server_handles: SharedServerHandles = Arc::new(RwLock::new(BTreeMap::from([(
+            base_url.to_string(),
+            test_handle(),
+        )])));
+        let server_tasks: SharedServerTasks = Arc::new(Mutex::new(Vec::new()));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+        let runtime = LiveSetupState {
+            status,
+            server_handles: server_handles.clone(),
+            server_tasks,
+            mutation_lock: Arc::new(Mutex::new(())),
+            wake_tx,
+            retry: RetryConfig {
+                base_ms: 1_000,
+                max_ms: 60_000,
+                jitter_ratio: 0.2,
+            },
+            replay: ReplayConfig {
+                dedupe_window_size: 500,
+                discard_before_ts: None,
+            },
+            attention: AttentionConfig::default(),
+            shutdown_tx,
+        };
+
+        let result = perform_setup(
+            SetupRequest {
+                url: base_url.to_string(),
+                name: Some("heimdal-new".to_string()),
+                identity: None,
+            },
+            Some(runtime),
+        )
+        .await
+        .unwrap();
+
+        let stored = StoredConfig::load(&paths.config_path).unwrap();
+        assert!(result.applied_live);
+        assert!(result.had_existing_session);
+        assert_eq!(result.identity, "heimdal");
+        assert_eq!(result.agent_id, identity.public_key);
+        assert_eq!(
+            stored.servers[0].registration_name.as_deref(),
+            Some("heimdal-new")
+        );
+        assert_eq!(stored.servers[0].identity.as_deref(), Some("heimdal"));
+        assert!(server_handles.read().await.contains_key(base_url));
+    }
+}

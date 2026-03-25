@@ -172,4 +172,15 @@ mod tests {
         .unwrap();
         assert!(store.should_enqueue("m1", "2026-03-18T05:00:00-07:00"));
     }
+
+    #[test]
+    fn dedupe_window_size_bounds_recent_ids() {
+        let dir = tempdir().unwrap();
+        let mut store = RuntimeStore::load(dir.path().join("runtime.json"), 1, None).unwrap();
+        assert!(store.should_enqueue("m1", "2026-03-18T12:00:00Z"));
+        store.mark_processed("m1", "2026-03-18T12:00:00Z");
+        assert!(store.should_enqueue("m2", "2026-03-18T12:00:01Z"));
+        store.mark_processed("m2", "2026-03-18T12:00:01Z");
+        assert!(store.should_enqueue("m1", "2026-03-18T12:00:02Z"));
+    }
 }
