@@ -6,6 +6,7 @@ mod launchd;
 mod logging;
 mod retry;
 mod runtime_store;
+mod setup;
 mod state_lock;
 mod subspace;
 mod supervisor;
@@ -14,19 +15,17 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
-use reqwest::Client;
-
 use crate::config::{
     Config, StoredConfig, canonicalize_base_url, default_config_path, default_registration_name,
     derive_app_paths, derive_server_key,
 };
-use crate::ipc::client::send_via_socket;
+use crate::ipc::client::{ClientSendRequest, send_via_socket, setup_via_socket};
+use crate::setup::{SetupRequest, perform_setup};
 use crate::state_lock::StateLock;
-use crate::subspace::auth::acquire_session_token;
-use crate::subspace::identity::SubspaceSessionRecord;
+use crate::subspace::identity::{LoadedSessionRecord, load_session_record};
 use crate::supervisor::run_supervisor;
+use anyhow::{Result, bail};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "subspace-daemon")]
@@ -71,6 +70,8 @@ struct SetupArgs {
     url: String,
     #[arg(long)]
     name: Option<String>,
+    #[arg(long)]
+    identity: Option<String>,
 }
 
 fn argv0_mode() -> Option<&'static str> {
@@ -127,9 +128,12 @@ async fn send(args: SendArgs) -> Result<()> {
     let config = Config::load(args.config)?;
     let response = send_via_socket(
         &config.paths.socket_path,
-        &args.text,
-        args.idempotency_key.as_deref(),
-        server,
+        &ClientSendRequest {
+            text: args.text,
+            idempotency_key: args.idempotency_key,
+            server: server.map(ToOwned::to_owned),
+            ..ClientSendRequest::default()
+        },
     )
     .await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
@@ -138,46 +142,30 @@ async fn send(args: SendArgs) -> Result<()> {
 
 async fn setup(args: SetupArgs) -> Result<()> {
     let config_path = default_config_path();
-    let paths = derive_app_paths(config_path.clone(), None)?;
-    let _lock = StateLock::try_acquire(&paths.state_lock_path)?;
-
     let base_url = canonicalize_base_url(&args.url)?;
-    let server_key = derive_server_key(&base_url)?;
-    let server_dir = paths.root.join("servers").join(&server_key);
-    let session_path = server_dir.join("subspace-session.json");
-
-    let requested_name = match args.name {
-        Some(name) => validate_registration_name(name)?,
-        None => prompt_with_default("Subspace registration name", &default_registration_name())?,
+    let existing_name = existing_setup_registration_name(&config_path, &base_url)?;
+    let request = SetupRequest {
+        url: args.url,
+        name: match args.name {
+            Some(name) => Some(validate_registration_name(name)?),
+            None if existing_name.is_some() => None,
+            None => Some(prompt_with_default(
+                "Subspace registration name",
+                &default_registration_name(),
+            )?),
+        },
+        identity: args.identity,
     };
-
-    let mut stored = StoredConfig::load_or_default(&config_path)?;
-    let had_existing_session = SubspaceSessionRecord::load(&session_path)?.is_some();
-    let mut session = match SubspaceSessionRecord::load(&session_path)? {
-        Some(mut existing) => {
-            existing.name = requested_name.clone();
-            existing
+    let paths = derive_app_paths(config_path, None)?;
+    let result = match StateLock::try_acquire(&paths.state_lock_path)? {
+        Some(lock_guard) => {
+            let result = perform_setup(request, None).await?;
+            drop(lock_guard);
+            result
         }
-        None => SubspaceSessionRecord::new("openclaw", &requested_name),
+        None => setup_via_socket(&paths.socket_path, &request).await?,
     };
-
-    let http = Client::builder().build()?;
-    let token = acquire_session_token(&http, &base_url, &session).await?;
-    session.update_session_token(token);
-    session.persist(&session_path)?;
-
-    stored.upsert_server(base_url.clone(), requested_name.clone());
-    stored.save(&config_path)?;
-
-    println!("configured Subspace server");
-    println!("base_url: {base_url}");
-    println!("server_key: {server_key}");
-    println!("session_path: {}", session_path.display());
-    println!("config_path: {}", config_path.display());
-    if had_existing_session {
-        println!("identity: preserved existing keypair, refreshed session token");
-    }
-    println!("agent_id: {}", session.public_key);
+    print_setup_result(&result);
     Ok(())
 }
 
@@ -187,6 +175,35 @@ fn validate_registration_name(name: String) -> Result<String> {
         bail!("registration name must not be empty");
     }
     Ok(trimmed.to_string())
+}
+
+fn existing_setup_registration_name(config_path: &PathBuf, base_url: &str) -> Result<Option<String>> {
+    let stored = StoredConfig::load_or_default(config_path)?;
+    if let Some(name) = stored
+        .servers
+        .into_iter()
+        .find(|server| {
+            canonicalize_base_url(&server.base_url)
+                .map(|value| value == base_url)
+                .unwrap_or(false)
+        })
+        .and_then(|server| server.registration_name)
+    {
+        return Ok(Some(name));
+    }
+
+    let paths = derive_app_paths(config_path.clone(), None)?;
+    let server_key = derive_server_key(base_url)?;
+    let session_path = paths
+        .root
+        .join("servers")
+        .join(server_key)
+        .join("subspace-session.json");
+    let existing_session = load_session_record(&session_path)?;
+    Ok(match existing_session {
+        Some(LoadedSessionRecord::Legacy(session)) => Some(session.registration_name),
+        _ => None,
+    })
 }
 
 fn prompt_with_default(label: &str, default: &str) -> Result<String> {
@@ -199,4 +216,91 @@ fn prompt_with_default(label: &str, default: &str) -> Result<String> {
         return Ok(default.to_string());
     }
     validate_registration_name(trimmed.to_string())
+}
+
+fn print_setup_result(result: &crate::setup::SetupResult) {
+    println!("configured Subspace server");
+    println!("base_url: {}", result.base_url);
+    println!("server_key: {}", result.server_key);
+    println!("session_path: {}", result.session_path);
+    println!("config_path: {}", result.config_path);
+    if result.had_existing_session {
+        println!("identity: preserved existing identity assignment");
+    } else {
+        println!("identity: {}", result.identity);
+    }
+    if result.applied_live {
+        println!("live_apply: true");
+    }
+    println!("agent_id: {}", result.agent_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use rand::rngs::OsRng;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn existing_setup_registration_name_prefers_config_entry() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "servers": [
+                {
+                  "base_url": "https://subspace.example.com",
+                  "registration_name": "heimdal",
+                  "identity": "heimdal"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let name =
+            existing_setup_registration_name(&config_path, "https://subspace.example.com").unwrap();
+        assert_eq!(name.as_deref(), Some("heimdal"));
+    }
+
+    #[test]
+    fn existing_setup_registration_name_uses_legacy_session_when_config_missing() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(&config_path, "{}").unwrap();
+
+        let paths = derive_app_paths(config_path.clone(), None).unwrap();
+        let server_key = derive_server_key("https://subspace.example.com").unwrap();
+        let session_path = paths
+            .root
+            .join("servers")
+            .join(server_key)
+            .join("subspace-session.json");
+        fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        fs::write(
+            &session_path,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "public_key": "agent",
+                "private_key": URL_SAFE_NO_PAD.encode(signing_key.to_pkcs8_der().unwrap().as_bytes()),
+                "owner": "openclaw",
+                "name": "legacy-name",
+                "session_token": "token"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let name =
+            existing_setup_registration_name(&config_path, "https://subspace.example.com").unwrap();
+        assert_eq!(name.as_deref(), Some("legacy-name"));
+    }
 }

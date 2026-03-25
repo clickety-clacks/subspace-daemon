@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 #[derive(Debug, Default)]
 pub struct RuntimeStore {
     path: PathBuf,
+    dedupe_window_size: usize,
+    discard_before_ts: Option<String>,
     last_seen_ts: Option<String>,
     recent_ids_order: VecDeque<String>,
     recent_ids_set: HashSet<String>,
@@ -21,10 +24,16 @@ struct RuntimeFile {
 }
 
 impl RuntimeStore {
-    pub fn load(path: PathBuf) -> Result<Self> {
+    pub fn load(
+        path: PathBuf,
+        dedupe_window_size: usize,
+        discard_before_ts: Option<String>,
+    ) -> Result<Self> {
         if !path.exists() {
             return Ok(Self {
                 path,
+                dedupe_window_size,
+                discard_before_ts,
                 ..Self::default()
             });
         }
@@ -34,6 +43,8 @@ impl RuntimeStore {
             .with_context(|| format!("failed parsing runtime store {}", path.display()))?;
         let mut store = Self {
             path,
+            dedupe_window_size,
+            discard_before_ts,
             last_seen_ts: parsed.last_seen_ts,
             recent_ids_order: VecDeque::new(),
             recent_ids_set: HashSet::new(),
@@ -45,7 +56,10 @@ impl RuntimeStore {
         Ok(store)
     }
 
-    pub fn should_enqueue(&mut self, message_id: &str) -> bool {
+    pub fn should_enqueue(&mut self, message_id: &str, timestamp: &str) -> bool {
+        if timestamp_before_floor(timestamp, self.discard_before_ts.as_deref()) {
+            return false;
+        }
         if self.recent_ids_set.contains(message_id) || self.pending_ids.contains(message_id) {
             return false;
         }
@@ -80,11 +94,24 @@ impl RuntimeStore {
         if self.recent_ids_set.insert(id.clone()) {
             self.recent_ids_order.push_back(id);
         }
-        while self.recent_ids_order.len() > 500 {
+        while self.recent_ids_order.len() > self.dedupe_window_size {
             if let Some(oldest) = self.recent_ids_order.pop_front() {
                 self.recent_ids_set.remove(&oldest);
             }
         }
+    }
+}
+
+fn timestamp_before_floor(timestamp: &str, floor: Option<&str>) -> bool {
+    let Some(floor) = floor else {
+        return false;
+    };
+    match (
+        OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339),
+        OffsetDateTime::parse(floor, &time::format_description::well_known::Rfc3339),
+    ) {
+        (Ok(timestamp), Ok(floor)) => timestamp < floor,
+        _ => timestamp < floor,
     }
 }
 
@@ -114,10 +141,35 @@ mod tests {
     #[test]
     fn dedupes_pending_and_recent_ids() {
         let dir = tempdir().unwrap();
-        let mut store = RuntimeStore::load(dir.path().join("runtime.json")).unwrap();
-        assert!(store.should_enqueue("m1"));
-        assert!(!store.should_enqueue("m1"));
+        let mut store = RuntimeStore::load(dir.path().join("runtime.json"), 500, None).unwrap();
+        assert!(store.should_enqueue("m1", "2026-03-18T12:00:00Z"));
+        assert!(!store.should_enqueue("m1", "2026-03-18T12:00:00Z"));
         store.mark_processed("m1", "2026-03-18T12:00:00Z");
-        assert!(!store.should_enqueue("m1"));
+        assert!(!store.should_enqueue("m1", "2026-03-18T12:00:00Z"));
+    }
+
+    #[test]
+    fn drops_messages_older_than_discard_floor() {
+        let dir = tempdir().unwrap();
+        let mut store = RuntimeStore::load(
+            dir.path().join("runtime.json"),
+            500,
+            Some("2026-03-18T12:00:00Z".to_string()),
+        )
+        .unwrap();
+        assert!(!store.should_enqueue("m1", "2026-03-18T11:59:59Z"));
+        assert!(store.should_enqueue("m2", "2026-03-18T12:00:00Z"));
+    }
+
+    #[test]
+    fn compares_discard_floor_by_timestamp_not_string_order() {
+        let dir = tempdir().unwrap();
+        let mut store = RuntimeStore::load(
+            dir.path().join("runtime.json"),
+            500,
+            Some("2026-03-18T12:00:00Z".to_string()),
+        )
+        .unwrap();
+        assert!(store.should_enqueue("m1", "2026-03-18T05:00:00-07:00"));
     }
 }

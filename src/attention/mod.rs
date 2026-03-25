@@ -10,6 +10,8 @@ pub mod embedding_plugin;
 pub mod receptor;
 pub mod scoring;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
@@ -19,6 +21,8 @@ use scoring::{compute_receptor_vector, cosine_similarity};
 
 /// Default threshold for receptor matching.
 pub const DEFAULT_THRESHOLD: f32 = 0.45;
+pub const OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID: &str = "openai:text-embedding-3-small:1536:v1";
+pub const OPENAI_TEXT_EMBEDDING_3_LARGE_SPACE_ID: &str = "openai:text-embedding-3-large:3072:v1";
 
 /// Configuration for the attention layer.
 #[derive(Debug, Clone)]
@@ -39,6 +43,22 @@ impl Default for AttentionConfig {
             threshold: DEFAULT_THRESHOLD,
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct MessageEmbedding {
+    pub space_id: String,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct OutboundEmbeddingRequest {
+    #[serde(default)]
+    pub embeddings: Vec<MessageEmbedding>,
+    #[serde(default)]
+    pub generate_for_spaces: Vec<String>,
+    #[serde(default)]
+    pub generated_embeddings_override_supplied: bool,
 }
 
 /// A match result for a single receptor.
@@ -99,11 +119,7 @@ impl AttentionLayer {
         };
 
         // Find first enabled embedding backend
-        let backend_config = config
-            .embedding_backends
-            .iter()
-            .find(|b| b.enabled)
-            .cloned();
+        let backend_config = first_enabled_backend(&config.embedding_backends);
 
         if let Some(backend_config) = backend_config {
             let client = EmbeddingPluginClient::new(backend_config);
@@ -131,6 +147,14 @@ impl AttentionLayer {
                 event = "no_embedding_backend",
                 "no embedding backend configured; attention layer disabled"
             );
+            if !config.local_pack_paths.is_empty() {
+                warn!(
+                    component = "attention",
+                    event = "embedding_backend_missing_for_receptors",
+                    "receptors configured without an embedding backend; attention layer degraded"
+                );
+                layer.degraded = true;
+            }
         }
 
         // Load receptor definitions
@@ -220,7 +244,10 @@ impl AttentionLayer {
 
             // Embed positive texts
             let pos_vectors = plugin.embed(&pos_texts).await.with_context(|| {
-                format!("failed to embed positive examples for receptor: {}", def.receptor_id)
+                format!(
+                    "failed to embed positive examples for receptor: {}",
+                    def.receptor_id
+                )
             })?;
 
             // Embed negative texts if any
@@ -235,7 +262,10 @@ impl AttentionLayer {
                 Vec::new()
             } else {
                 plugin.embed(&neg_texts).await.with_context(|| {
-                    format!("failed to embed negative examples for receptor: {}", def.receptor_id)
+                    format!(
+                        "failed to embed negative examples for receptor: {}",
+                        def.receptor_id
+                    )
                 })?
             };
 
@@ -272,7 +302,11 @@ impl AttentionLayer {
     /// Evaluate a message against all receptors and decide whether to deliver.
     ///
     /// Returns an AttentionResult with delivery decision and match details.
-    pub async fn evaluate(&self, message_text: &str) -> AttentionResult {
+    pub async fn evaluate(
+        &self,
+        _message_text: &str,
+        sender_embeddings: &[MessageEmbedding],
+    ) -> AttentionResult {
         // Fallback: deliver all if no receptors configured
         if self.receptors.is_empty() {
             return AttentionResult {
@@ -311,45 +345,15 @@ impl AttentionLayer {
         }
 
         // Embed the message
-        let Some(plugin) = &self.plugin else {
-            // No plugin but have non-wildcard receptors - this is a config error, deliver all
+        let Some((message_vector, vector_space_id)) =
+            self.select_sender_message_vector(sender_embeddings)
+        else {
             return AttentionResult {
-                deliver: true,
+                deliver: false,
                 matches: Vec::new(),
                 space_id: None,
-                fallback: true,
+                fallback: false,
             };
-        };
-
-        let message_vector = match plugin.embed(&[message_text]).await {
-            Ok(mut vecs) if !vecs.is_empty() => vecs.remove(0),
-            Ok(_) => {
-                warn!(
-                    component = "attention",
-                    event = "embed_empty_response",
-                    "embedding plugin returned no vectors; falling back to deliver"
-                );
-                return AttentionResult {
-                    deliver: true,
-                    matches: Vec::new(),
-                    space_id: self.space_id.clone(),
-                    fallback: true,
-                };
-            }
-            Err(err) => {
-                warn!(
-                    component = "attention",
-                    event = "embed_failed",
-                    error = %err,
-                    "failed to embed message; falling back to deliver"
-                );
-                return AttentionResult {
-                    deliver: true,
-                    matches: Vec::new(),
-                    space_id: self.space_id.clone(),
-                    fallback: true,
-                };
-            }
         };
 
         // Score against each receptor
@@ -362,7 +366,7 @@ impl AttentionLayer {
             };
 
             // Only compare vectors from same space_id
-            if receptor.space_id != self.space_id {
+            if receptor.space_id.as_deref() != Some(vector_space_id.as_str()) {
                 continue;
             }
 
@@ -382,14 +386,36 @@ impl AttentionLayer {
         }
 
         // Sort matches by score descending
-        matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        matches.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         AttentionResult {
             deliver: any_above_threshold,
             matches,
-            space_id: self.space_id.clone(),
+            space_id: Some(vector_space_id),
             fallback: false,
         }
+    }
+
+    fn select_sender_message_vector(
+        &self,
+        sender_embeddings: &[MessageEmbedding],
+    ) -> Option<(Vec<f32>, String)> {
+        if let Some(space_id) = self.space_id.as_deref() {
+            if let Some(sender_embedding) = sender_embeddings
+                .iter()
+                .find(|embedding| embedding.space_id == space_id)
+            {
+                return Some((
+                    sender_embedding.vector.clone(),
+                    sender_embedding.space_id.clone(),
+                ));
+            }
+        }
+        None
     }
 
     /// Get the number of configured receptors.
@@ -402,10 +428,145 @@ impl AttentionLayer {
         self.degraded
     }
 
-    /// Check if the attention layer has any receptors configured.
-    pub fn has_receptors(&self) -> bool {
-        !self.receptors.is_empty()
+}
+
+pub fn validate_generated_spaces(requested_spaces: &[String]) -> Result<()> {
+    for raw_space in requested_spaces {
+        let space_id = raw_space.trim();
+        if space_id.is_empty() {
+            anyhow::bail!("generate_for_spaces entries must not be empty");
+        }
+        if !is_supported_generated_space(space_id) {
+            anyhow::bail!(
+                "unsupported generated embedding space: {space_id}; supported spaces are {} and {}",
+                OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID,
+                OPENAI_TEXT_EMBEDDING_3_LARGE_SPACE_ID
+            );
+        }
     }
+    Ok(())
+}
+
+pub fn configured_generated_embedding_clients(
+    config: &AttentionConfig,
+) -> BTreeMap<String, EmbeddingPluginClient> {
+    config
+        .embedding_backends
+        .iter()
+        .filter(|backend| backend.enabled)
+        .filter(|backend| is_supported_generated_space(&backend.default_space_id))
+        .filter_map(|backend| {
+            let client = EmbeddingPluginClient::new(backend.clone());
+            if client.is_available() {
+                Some((backend.default_space_id.clone(), client))
+            } else {
+                warn!(
+                    component = "attention",
+                    event = "generated_embedding_backend_unavailable",
+                    backend_id = %backend.backend_id,
+                    space_id = %backend.default_space_id,
+                    "generated embedding backend unavailable; omitting space"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+pub async fn compose_outbound_embeddings(
+    text: &str,
+    request: &OutboundEmbeddingRequest,
+    generated_clients: &BTreeMap<String, EmbeddingPluginClient>,
+) -> Vec<MessageEmbedding> {
+    let mut generated_embeddings = Vec::new();
+
+    for space_id in request
+        .generate_for_spaces
+        .iter()
+        .map(|space| space.trim())
+        .filter(|space| !space.is_empty())
+        .collect::<BTreeSet<_>>()
+    {
+        if !request.generated_embeddings_override_supplied
+            && request
+                .embeddings
+                .iter()
+                .any(|embedding| embedding.space_id == space_id)
+        {
+            continue;
+        }
+        let Some(client) = generated_clients.get(space_id) else {
+            warn!(
+                component = "attention",
+                event = "generated_embedding_backend_missing",
+                space_id = %space_id,
+                "requested generated embedding space is not configured locally; omitting space"
+            );
+            continue;
+        };
+        match client.embed(&[text]).await {
+            Ok(mut vectors) if !vectors.is_empty() => generated_embeddings.push(MessageEmbedding {
+                space_id: space_id.to_string(),
+                vector: vectors.remove(0),
+            }),
+            Ok(_) => warn!(
+                component = "attention",
+                event = "generated_embedding_empty",
+                space_id = %space_id,
+                "generated embedding backend returned no vectors; omitting space"
+            ),
+            Err(err) => warn!(
+                component = "attention",
+                event = "generated_embedding_failed",
+                space_id = %space_id,
+                error = %err,
+                "generated embedding failed; sending without that space"
+            ),
+        }
+    }
+
+    merge_outbound_embeddings(
+        &request.embeddings,
+        generated_embeddings,
+        request.generated_embeddings_override_supplied,
+    )
+}
+
+fn is_supported_generated_space(space_id: &str) -> bool {
+    matches!(
+        space_id,
+        OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID | OPENAI_TEXT_EMBEDDING_3_LARGE_SPACE_ID
+    )
+}
+
+fn merge_outbound_embeddings(
+    supplied_embeddings: &[MessageEmbedding],
+    generated_embeddings: Vec<MessageEmbedding>,
+    generated_embeddings_override_supplied: bool,
+) -> Vec<MessageEmbedding> {
+    let mut embeddings_by_space = BTreeMap::<String, MessageEmbedding>::new();
+    if generated_embeddings_override_supplied {
+        for embedding in supplied_embeddings {
+            embeddings_by_space.insert(embedding.space_id.clone(), embedding.clone());
+        }
+        for embedding in generated_embeddings {
+            embeddings_by_space.insert(embedding.space_id.clone(), embedding);
+        }
+    } else {
+        for embedding in generated_embeddings {
+            embeddings_by_space.insert(embedding.space_id.clone(), embedding);
+        }
+        for embedding in supplied_embeddings {
+            embeddings_by_space.insert(embedding.space_id.clone(), embedding.clone());
+        }
+    }
+    embeddings_by_space.into_values().collect()
+}
+
+fn first_enabled_backend(
+    embedding_backends: &[EmbeddingBackendConfig],
+) -> Option<EmbeddingBackendConfig> {
+    embedding_backends.iter().find(|b| b.enabled).cloned()
 }
 
 /// Format receptor matches for inclusion in a delivered message.
@@ -435,13 +596,165 @@ pub fn format_attention_annotation(result: &AttentionResult) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn passthrough_delivers_all() {
         let layer = AttentionLayer::passthrough();
-        let result = layer.evaluate("any message").await;
+        let result = layer.evaluate("any message", &[]).await;
         assert!(result.deliver);
         assert!(result.fallback);
+    }
+
+    #[tokio::test]
+    async fn prefers_sender_embedding_for_matching_space() {
+        let layer = AttentionLayer {
+            config: AttentionConfig {
+                threshold: 0.5,
+                ..AttentionConfig::default()
+            },
+            receptors: vec![ComputedReceptor {
+                receptor_id: "match".to_string(),
+                class: ReceptorClass::Broad,
+                vector: Some(vec![1.0, 0.0]),
+                space_id: Some("test:model:2:v1".to_string()),
+            }],
+            plugin: None,
+            space_id: Some("test:model:2:v1".to_string()),
+            degraded: false,
+        };
+
+        let result = layer
+            .evaluate(
+                "ignored because sender supplied vector",
+                &[MessageEmbedding {
+                    space_id: "test:model:2:v1".to_string(),
+                    vector: vec![0.9, 0.1],
+                }],
+            )
+            .await;
+
+        assert!(result.deliver);
+        assert!(!result.fallback);
+        assert_eq!(result.space_id.as_deref(), Some("test:model:2:v1"));
+    }
+
+    #[tokio::test]
+    async fn does_not_self_embed_when_sender_embedding_is_missing() {
+        let layer = AttentionLayer {
+            config: AttentionConfig {
+                threshold: 0.5,
+                ..AttentionConfig::default()
+            },
+            receptors: vec![ComputedReceptor {
+                receptor_id: "match".to_string(),
+                class: ReceptorClass::Broad,
+                vector: Some(vec![1.0, 0.0]),
+                space_id: Some("test:model:2:v1".to_string()),
+            }],
+            plugin: None,
+            space_id: Some("test:model:2:v1".to_string()),
+            degraded: false,
+        };
+
+        let result = layer.evaluate("no attached embedding", &[]).await;
+
+        assert!(!result.deliver);
+        assert!(!result.fallback);
+        assert_eq!(result.space_id, None);
+    }
+
+    #[tokio::test]
+    async fn missing_backend_with_receptors_degrades_to_passthrough() {
+        let layer = AttentionLayer {
+            config: AttentionConfig::default(),
+            receptors: vec![ComputedReceptor {
+                receptor_id: "match".to_string(),
+                class: ReceptorClass::Broad,
+                vector: None,
+                space_id: None,
+            }],
+            plugin: None,
+            space_id: None,
+            degraded: true,
+        };
+
+        let result = layer.evaluate("plaintext only", &[]).await;
+
+        assert!(result.deliver);
+        assert!(result.fallback);
+    }
+
+    #[tokio::test]
+    async fn new_degrades_when_receptors_exist_without_backend() {
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("pack.json");
+        fs::write(
+            &pack_path,
+            r#"{
+              "pack_id": "test-pack",
+              "version": "1.0.0",
+              "receptors": [
+                {
+                  "receptor_id": "match",
+                  "class": "broad",
+                  "description": "subspace daemon review findings"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let layer = AttentionLayer::new(AttentionConfig {
+            local_pack_paths: vec![pack_path.display().to_string()],
+            embedding_backends: Vec::new(),
+            threshold: DEFAULT_THRESHOLD,
+        })
+        .await
+        .unwrap();
+
+        let result = layer.evaluate("plaintext only", &[]).await;
+
+        assert!(layer.is_degraded());
+        assert!(result.deliver);
+        assert!(result.fallback);
+    }
+
+    #[test]
+    fn supplied_embeddings_win_by_default_on_duplicate_space() {
+        let merged = merge_outbound_embeddings(
+            &[MessageEmbedding {
+                space_id: OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID.to_string(),
+                vector: vec![1.0],
+            }],
+            vec![MessageEmbedding {
+                space_id: OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID.to_string(),
+                vector: vec![2.0],
+            }],
+            false,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].vector, vec![1.0]);
+    }
+
+    #[test]
+    fn generated_embeddings_can_override_supplied_on_duplicate_space() {
+        let merged = merge_outbound_embeddings(
+            &[MessageEmbedding {
+                space_id: OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID.to_string(),
+                vector: vec![1.0],
+            }],
+            vec![MessageEmbedding {
+                space_id: OPENAI_TEXT_EMBEDDING_3_SMALL_SPACE_ID.to_string(),
+                vector: vec![2.0],
+            }],
+            true,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].vector, vec![2.0]);
     }
 
     #[test]

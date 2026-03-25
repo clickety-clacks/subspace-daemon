@@ -7,15 +7,15 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::attention::{AttentionLayer, AttentionResult, format_attention_annotation};
+use crate::attention::{AttentionLayer, AttentionResult, MessageEmbedding, format_attention_annotation};
 use crate::config::{Config, RetryConfig};
 use crate::gateway::client::{GatewayClientHandle, start_gateway_client};
 use crate::ipc::{SendRouter, run_ipc_server};
 use crate::launchd::render_launchd_plist;
 use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
+use crate::setup::{LiveSetupState, SharedServerHandles, SharedServerTasks, spawn_server_manager};
 use crate::state_lock::StateLock;
-use crate::subspace::client::{ServerHandle, start_server_manager};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerHealth {
@@ -103,7 +103,6 @@ pub struct ServerSendResultEnvelope {
     pub error: Option<String>,
 }
 
-#[derive(Debug)]
 pub struct WakeEnvelope {
     pub server: String,
     pub server_key: String,
@@ -112,6 +111,8 @@ pub struct WakeEnvelope {
     pub author_id: String,
     pub author_name: String,
     pub text: String,
+    pub sender_embeddings: Vec<MessageEmbedding>,
+    pub attention: Arc<AttentionLayer>,
     pub runtime: Arc<Mutex<RuntimeStore>>,
     pub wake_session_key_override: Option<String>,
 }
@@ -136,44 +137,31 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
     let status = Arc::new(RwLock::new(DaemonStatus::new(&config)));
     let (shutdown_tx, _) = broadcast::channel(4);
 
-    // Initialize attention layer
-    let attention = AttentionLayer::new(config.attention.clone()).await?;
-    let attention = Arc::new(attention);
-    info!(
-        component = "supervisor",
-        event = "attention_layer_initialized",
-        receptor_count = attention.receptor_count(),
-        degraded = attention.is_degraded(),
-        "attention layer initialized"
-    );
-
     let (gateway, gateway_task) =
         start_gateway_client(config.clone(), status.clone(), shutdown_tx.subscribe()).await?;
 
     let (wake_tx, wake_rx) = mpsc::channel(1000);
-    let mut server_tasks = Vec::new();
-    let mut server_handles = BTreeMap::<String, ServerHandle>::new();
+    let server_tasks: SharedServerTasks = Arc::new(Mutex::new(Vec::new()));
+    let server_handles: SharedServerHandles = Arc::new(RwLock::new(BTreeMap::new()));
+    let setup_state = LiveSetupState {
+        status: status.clone(),
+        server_handles: server_handles.clone(),
+        server_tasks: server_tasks.clone(),
+        mutation_lock: Arc::new(Mutex::new(())),
+        wake_tx: wake_tx.clone(),
+        retry: config.retry.clone(),
+        replay: config.replay.clone(),
+        attention: config.attention.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+    };
     for server in config.servers.iter().filter(|server| server.enabled) {
-        let (handle, task) = start_server_manager(
+        spawn_server_manager(
+            &setup_state,
             server.clone(),
-            config.retry.clone(),
-            status.clone(),
-            wake_tx.clone(),
-            shutdown_tx.subscribe(),
+            config.paths.identities_dir.clone(),
         )
         .await?;
-        server_handles.insert(server.base_url.clone(), handle);
-        server_tasks.push((server.server_key.clone(), task));
     }
-    // Only drop the original wake_tx if at least one server manager was started.
-    // Otherwise, keep it alive to prevent wake_rx from immediately seeing None
-    // (which would cause the wake_queue to exit unexpectedly).
-    let _wake_tx_keepalive = if server_tasks.is_empty() {
-        Some(wake_tx)
-    } else {
-        drop(wake_tx);
-        None
-    };
 
     let send_router = SendRouter::new(status.clone(), server_handles.clone());
     let wake_task = tokio::spawn(process_wake_queue(
@@ -181,13 +169,13 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
         gateway.clone(),
         config.routing.wake_session_key.clone(),
         config.retry.clone(),
-        attention.clone(),
         shutdown_tx.subscribe(),
     ));
     let ipc_task = tokio::spawn(run_ipc_server(
         config.paths.socket_path.clone(),
         status.clone(),
         send_router,
+        setup_state,
         shutdown_tx.subscribe(),
     ));
 
@@ -211,7 +199,7 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
                 let _ = tokio::time::timeout(Duration::from_secs(5), &mut wake_task).await;
                 let _ = tokio::time::timeout(Duration::from_secs(5), &mut gateway_task).await;
                 let _ = tokio::time::timeout(Duration::from_secs(5), &mut ipc_task).await;
-                for (_, task) in &mut server_tasks {
+                for (_, task) in server_tasks.lock().await.iter_mut() {
                     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
                 }
                 let _ = tokio::fs::remove_file(&config.paths.socket_path).await;
@@ -233,7 +221,7 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
                 return handle_task_exit("ipc", result).await;
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if let Some(result) = check_server_exit(&mut server_tasks).await {
+                if let Some(result) = check_server_exit(&server_tasks).await {
                     let _ = shutdown_tx.send(());
                     let _ = tokio::fs::remove_file(&config.paths.socket_path).await;
                     return result;
@@ -243,10 +231,9 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
     }
 }
 
-async fn check_server_exit(
-    server_tasks: &mut Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
-) -> Option<Result<()>> {
-    for (server_key, task) in server_tasks.iter_mut() {
+async fn check_server_exit(server_tasks: &SharedServerTasks) -> Option<Result<()>> {
+    let mut tasks = server_tasks.lock().await;
+    for (server_key, task) in tasks.iter_mut() {
         if task.is_finished() {
             let result = task.await;
             return Some(handle_task_exit(&format!("subspace:{server_key}"), result).await);
@@ -277,7 +264,6 @@ async fn process_wake_queue(
     gateway: GatewayClientHandle,
     wake_session_key: String,
     retry: RetryConfig,
-    attention: Arc<AttentionLayer>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut shutting_down = false;
@@ -304,7 +290,10 @@ async fn process_wake_queue(
         };
 
         // Evaluate message against receptors
-        let attention_result = attention.evaluate(&item.text).await;
+        let attention_result = item
+            .attention
+            .evaluate(&item.text, &item.sender_embeddings)
+            .await;
 
         if !attention_result.deliver {
             // Message filtered out by attention layer

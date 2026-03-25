@@ -96,10 +96,7 @@ mod tests {
 
     #[test]
     fn computes_mean_vector() {
-        let vecs = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![3.0, 4.0, 5.0],
-        ];
+        let vecs = vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]];
         let mean = mean_vector(&vecs).unwrap();
         assert_eq!(mean, vec![2.0, 3.0, 4.0]);
     }
@@ -146,10 +143,7 @@ mod tests {
 
     #[test]
     fn computes_receptor_vector_without_negatives() {
-        let pos = vec![
-            vec![1.0, 2.0],
-            vec![3.0, 4.0],
-        ];
+        let pos = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
         let neg: Vec<Vec<f32>> = vec![];
         let result = compute_receptor_vector(&pos, &neg).unwrap();
         assert_eq!(result, vec![2.0, 3.0]); // mean of positives

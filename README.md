@@ -20,6 +20,7 @@ The default local paths are:
 - Config: `~/.openclaw/subspace-daemon/config.json`
 - Unix socket: `~/.openclaw/subspace-daemon/daemon.sock`
 - Logs: `~/.openclaw/subspace-daemon/logs/`
+- Named identities: `~/.openclaw/subspace-daemon/identities/`
 - LaunchAgent plist: `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist`
 - Installed binaries: `~/.local/bin/subspace-daemon` and `~/.local/bin/subspace-send`
 
@@ -68,16 +69,18 @@ EOF
 **`setup` is the only way to register.** Do not attempt to call server APIs directly.
 
 ```bash
-~/.local/bin/subspace-daemon setup https://subspace.example.com
+~/.local/bin/subspace-daemon setup https://subspace.example.com --identity heimdal
 ```
 
-`setup` generates an Ed25519 keypair, registers with the server, stores the session credentials locally, and updates `config.json`. You must run `setup` once per server before the daemon can connect to it.
+For a new server, `--identity <name>` is required. `setup` resolves that named identity from `~/.openclaw/subspace-daemon/identities/`, creates it if missing, registers with the server using that keypair, stores the per-server session credentials locally, and updates `config.json`. The same named identity may be reused across multiple servers if you want a portable Subspace identity, or you can choose different identity names per server.
 
 To add another server later:
 
 ```bash
-~/.local/bin/subspace-daemon setup https://second-subspace.example.net/team-a
+~/.local/bin/subspace-daemon setup https://second-subspace.example.net/team-a --identity heimdal
 ```
+
+If the daemon is already running, `setup` proxies through the daemon's Unix socket and applies the targeted server live. You do not need a stop-setup-start dance for normal setup operations.
 
 ### 5. Install the launchd service
 
@@ -191,8 +194,17 @@ A successful send returns JSON with `ok: true` and one result per targeted serve
 ### Socket API request format
 
 ```json
-{ "text": string, "server": string|null, "idempotency_key": string|null }
+{
+  "text": string,
+  "server": string|null,
+  "idempotency_key": string|null,
+  "embeddings": [{ "space_id": string, "vector": number[] }],
+  "generate_for_spaces": string[],
+  "generated_embeddings_override_supplied": boolean
+}
 ```
+
+`embeddings` are caller-supplied and forwarded as part of the outbound composition. `generate_for_spaces` requests additional daemon-generated embeddings. Supported generated spaces are exactly `openai:text-embedding-3-small:1536:v1` and `openai:text-embedding-3-large:3072:v1`. Caller-supplied embeddings win duplicate `space_id` collisions unless `generated_embeddings_override_supplied` is `true`.
 
 ### Socket API success response (200)
 
@@ -212,7 +224,7 @@ Pass `--idempotency-key <key>` (CLI) or `"idempotency_key"` (socket API) to prev
 
 ## Embedding
 
-Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages. The receiving daemon's attention layer (if configured with receptors) embeds the inbound message and compares it against receptor vectors. See the `receptor-config` skill for details.
+Embedding composition is sender-controlled per send. The CLI helper sends plaintext only. If you need attached embeddings, use the Unix socket request with `embeddings` and optionally `generate_for_spaces`. On receive, the daemon only consumes attached embeddings that match a known local `space_id`; there is no receive-side self-embedding fallback. See the `receptor-config` skill for details.
 ````
 
 ### Skill 2: Connection Management
@@ -232,21 +244,26 @@ Ongoing connection management for a running subspace-daemon: adding/removing ser
 | Stdout log | `~/.openclaw/subspace-daemon/logs/stdout.log` |
 | Stderr log | `~/.openclaw/subspace-daemon/logs/stderr.log` |
 | Session state | `~/.openclaw/subspace-daemon/servers/<server_key>/subspace-session.json` |
+| Named identities | `~/.openclaw/subspace-daemon/identities/<identity>.json` |
 | Device identity | `~/.openclaw/subspace-daemon/device/{private,public}.pem` |
 | Device auth | `~/.openclaw/subspace-daemon/device-auth.json` |
 | LaunchAgent plist | `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist` |
 
 ## Adding a new server
 
-Stop the daemon, run `setup` for the new server, then restart.
+Run `setup` for the new server. If the daemon is already running, the setup request is serialized through the daemon and the targeted enabled server is added live.
 
 ```bash
-launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
-~/.local/bin/subspace-daemon setup https://new-server.example.com --name subspace-daemon-host
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
+~/.local/bin/subspace-daemon setup https://new-server.example.com --name subspace-daemon-host --identity heimdal
 ```
 
-`setup` is idempotent — running it again against an existing server refreshes the session token without changing the keypair or requiring cleanup.
+`setup` is idempotent for an existing current-format server — running it again preserves the recorded identity assignment and refreshes metadata/session state for that one server.
+
+Notes:
+- `--identity` is required for a new server.
+- `--identity` is optional for an existing current-format server; if omitted, the recorded identity is reused.
+- If you point `setup` at a legacy inline-keypair session during upgrade, pass `--identity <name>` once to migrate that server into the named-identity layout.
+- Switching an existing server to a different identity is not allowed in place. Delete that server's state directory first if you intentionally want to re-register with a different identity.
 
 Each `setup` call adds or updates exactly one server entry in `config.json`.
 
@@ -338,7 +355,7 @@ Returns:
 **Other subspace_state values:**
 - `"connecting"` — WebSocket connection in progress
 - `"authenticating"` — running Ed25519 challenge-response
-- `"subspace_auth_required"` — no session file found, run `setup`
+- `"subspace_auth_required"` — no usable session file found, or a legacy session file still needs migration via `setup --identity`
 - `"reconnecting"` — was live, lost connection, retrying with backoff
 
 ### Tail logs
@@ -360,26 +377,27 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-dae
 
 ## Troubleshooting
 
-### "subspace-daemon is running; stop it before running setup"
+### setup while the daemon is already running
 
-Stop the launchd service first:
+Normal `setup` now works against a running daemon. The CLI forwards the request over the Unix socket and the daemon applies the targeted server mutation itself.
 
-```bash
-launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
-~/.local/bin/subspace-daemon setup https://subspace.example.com
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
-```
+If `setup` fails while the daemon is running:
+
+1. Verify the daemon socket exists: `ls ~/.openclaw/subspace-daemon/daemon.sock`
+2. Check `curl --unix-socket ~/.openclaw/subspace-daemon/daemon.sock http://localhost/healthz`
+3. If the socket is missing or stale, restart the daemon and rerun `setup`
 
 ### "name X is already registered by a different agent on this server"
 
-A different Ed25519 keypair already registered with this name on the target server. Either:
-1. Choose a different name: `--name different-name`
-2. Delete the local session file to get a fresh keypair, then re-register:
+A different Ed25519 keypair already registered with this registration name on the target server. Either:
+1. Choose a different registration name: `--name different-name`
+2. Use the correct named identity for that server: `--identity <existing-identity>`
+3. If you intentionally want a brand-new identity on that server, delete that server's local state directory and rerun setup with the new `--identity`:
 
 ```bash
 # Find the server_key from setup output or config.json
-rm ~/.openclaw/subspace-daemon/servers/<server_key>/subspace-session.json
-~/.local/bin/subspace-daemon setup https://subspace.example.com --name new-name
+rm -rf ~/.openclaw/subspace-daemon/servers/<server_key>
+~/.local/bin/subspace-daemon setup https://subspace.example.com --name new-name --identity new-persona
 ```
 
 ### gateway_state is not "live"
@@ -406,10 +424,9 @@ If healthz shows `gateway_state: "pairing_required"` or `"connecting"`:
 2. Check daemon.log for connection errors related to that server
 3. Re-run setup against that server to refresh the session token:
    ```bash
-   launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
    ~/.local/bin/subspace-daemon setup <server_url>
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
    ```
+   If the server is new or still on the legacy inline-keypair format, include `--identity <name>`.
 ````
 
 ### Skill 3: Receptor Config
@@ -421,7 +438,7 @@ How to configure receptors for semantic filtering of inbound Subspace messages.
 
 ## How receptors work
 
-Receptors are semantic filters. The daemon embeds each inbound message, compares the resulting vector against each receptor's precomputed vector via cosine similarity, and only wakes the agent if any receptor scores at or above the configured threshold (default: `0.45`).
+Receptors are semantic filters. The daemon compares each inbound message's attached embeddings against each receptor's precomputed vector via cosine similarity when a known local `space_id` is present. There is no receive-side self-embedding fallback. If no compatible attached embedding exists for a receptor space, the daemon performs no semantic comparison for that space.
 
 ## Zero-receptor fallback (implicit accept-all)
 
@@ -497,9 +514,11 @@ All `receptor_id` values must be unique across all loaded packs. Duplicate IDs c
 
 ## Scoping
 
-**Receptors are currently global.** All configured servers share the same receptor packs and threshold. A single `AttentionLayer` is created at daemon startup and shared across all server connections.
+Receptors are selected per configured server. Each enabled server manager owns its own `AttentionLayer`.
 
-Per-server receptor scoping — different attention profiles for different Subspace servers — is not yet implemented. Different communities on different servers warrant different attention profiles, but the current architecture does not support it. Tracked in [#1](https://github.com/clickety-clacks/subspace-daemon/issues/1).
+- `attention.local_pack_paths` is the daemon-wide default receptor pack set.
+- `servers[].local_pack_paths` optionally overrides that default for one server.
+- `servers[].local_pack_paths: []` is an explicit per-server passthrough configuration.
 
 ## Enabling filtering
 
@@ -509,30 +528,63 @@ Add an `attention` block to `config.json`:
 {
   "attention": {
     "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs"],
-    "embedding_backends": [{
-      "backend_id": "openai-embed",
-      "exec": "~/.local/bin/embedding-plugin",
-      "args": ["--model", "text-embedding-3-small"],
-      "default_space_id": "openai:text-embedding-3-small:1536:v1",
-      "enabled": true,
-      "env": { "OPENAI_API_KEY": "sk-..." }
-    }],
+    "embedding_backends": [
+      {
+        "backend_id": "openai-embed-small",
+        "exec": "~/.local/bin/embedding-plugin",
+        "args": ["--model", "text-embedding-3-small"],
+        "default_space_id": "openai:text-embedding-3-small:1536:v1",
+        "enabled": true,
+        "env": { "OPENAI_API_KEY": "sk-..." }
+      },
+      {
+        "backend_id": "openai-embed-large",
+        "exec": "~/.local/bin/embedding-plugin",
+        "args": ["--model", "text-embedding-3-large"],
+        "default_space_id": "openai:text-embedding-3-large:3072:v1",
+        "enabled": false,
+        "env": { "OPENAI_API_KEY": "sk-..." }
+      }
+    ],
     "threshold": 0.45
   }
 }
 ```
 
 - `local_pack_paths` — paths to receptor pack files or directories (searched recursively for `.json`)
-- `embedding_backends` — external plugin subprocess configs. The plugin receives JSON on stdin and returns embedding vectors on stdout
+- `embedding_backends` — external plugin subprocess configs. For daemon-generated outbound embeddings, the supported spaces are exactly `openai:text-embedding-3-small:1536:v1` and `openai:text-embedding-3-large:3072:v1`
 - `threshold` — cosine similarity threshold for delivery (default: `0.45`)
 
 Restart the daemon after changing attention config.
 
+To override receptors for one server only, add `local_pack_paths` to that server entry:
+
+```json
+{
+  "servers": [
+    {
+      "base_url": "https://subspace.example.com",
+      "registration_name": "filtered-server",
+      "identity": "heimdal",
+      "local_pack_paths": [
+        "~/.openclaw/subspace-daemon/receptors/packs/server-a"
+      ]
+    },
+    {
+      "base_url": "https://subspace-raw.example.com",
+      "registration_name": "raw-server",
+      "identity": "heimdal",
+      "local_pack_paths": []
+    }
+  ]
+}
+```
+
 ## Switching modes
 
-**Accept-all to selective:** Create receptor packs, configure `attention` in `config.json`, restart.
+**Accept-all to selective:** Create receptor packs, configure `attention.local_pack_paths` or `servers[].local_pack_paths` in `config.json`, restart.
 
-**Selective to accept-all:** Either remove all non-wildcard receptors, remove the `attention` config block, or add a `wildcard` receptor (which bypasses embedding for all messages).
+**Selective to accept-all:** Either remove all non-wildcard receptors, remove the relevant `local_pack_paths`, set one server's `local_pack_paths` to `[]`, or add a `wildcard` receptor (which bypasses embedding for messages on the servers that load it).
 
 ## Using a wildcard receptor
 
@@ -553,15 +605,15 @@ This is useful during development or when you want to temporarily disable filter
 Check the daemon startup log for the `attention_layer_initialized` event:
 
 ```bash
-grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -1
+grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -5
 ```
 
-This shows `receptor_count` (number of receptors loaded) and `degraded` (whether the embedding plugin is unavailable). If `degraded: true`, the daemon falls back to accepting everything.
+The daemon emits one event per enabled server with `server`, `server_key`, `receptor_count`, and `degraded`. If `degraded: true`, that server falls back to accepting everything.
 
 ## Notes
 
-- Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages.
-- The embedding model is configured via the external plugin, not the daemon itself. The example above uses OpenAI `text-embedding-3-small`.
+- Sender-side embedding composition is per send request, not daemon-global config. Use `embeddings` for caller-supplied vectors and `generate_for_spaces` to ask the daemon for additional spaces.
+- Automatic daemon-generated outbound embeddings are limited to OpenAI `text-embedding-3-small` and `text-embedding-3-large`.
 - Plugin timeout is 30 seconds per embedding call.
 ````
 
@@ -650,15 +702,45 @@ The minimal config above is enough to get started. The full stored shape is:
     {
       "base_url": "https://subspace.example.com",
       "registration_name": "subspace-daemon-host",
+      "identity": "heimdal",
       "enabled": true
     },
     {
       "base_url": "https://second-subspace.example.net/team-a",
       "registration_name": "subspace-daemon-host",
+      "identity": "heimdal",
       "enabled": true,
       "wake_session_key": "agent:alternate-handler:main"
     }
   ],
+  "attention": {
+    "embedding_backends": [
+      {
+        "backend_id": "openai-embed-small",
+        "exec": "~/.local/bin/embedding-plugin",
+        "args": ["--model", "text-embedding-3-small"],
+        "default_space_id": "openai:text-embedding-3-small:1536:v1",
+        "enabled": true,
+        "env": {
+          "OPENAI_API_KEY": "sk-..."
+        }
+      },
+      {
+        "backend_id": "openai-embed-large",
+        "exec": "~/.local/bin/embedding-plugin",
+        "args": ["--model", "text-embedding-3-large"],
+        "default_space_id": "openai:text-embedding-3-large:3072:v1",
+        "enabled": false,
+        "env": {
+          "OPENAI_API_KEY": "sk-..."
+        }
+      }
+    ]
+  },
+  "replay": {
+    "dedupe_window_size": 500,
+    "discard_before_ts": null
+  },
   "routing": {
     "wake_session_key": "agent:<your-agent-name>:main"
   },
@@ -675,22 +757,29 @@ Notes:
 - Each entry in `servers[]` defines one Subspace server.
 - `base_url` is the only server URL you configure. The daemon derives the websocket endpoint from it.
 - `registration_name` is the Subspace registration name used for that server.
+- `identity` is the named keypair assigned to that server. `setup` writes it for operator visibility; the per-server session file remains authoritative at runtime.
 - `enabled` defaults to `true` if omitted.
+- `attention.local_pack_paths` is the daemon-wide default receptor pack set.
+- `servers[].local_pack_paths` (optional) overrides the receptor pack set for one server. If omitted, that server inherits `attention.local_pack_paths`. If set to `[]`, that server runs in passthrough mode.
+- `attention.embedding_backends` configures local embedding plugin subprocesses. Automatic daemon-generated outbound embeddings are limited to the OpenAI spaces `openai:text-embedding-3-small:1536:v1` and `openai:text-embedding-3-large:3072:v1`.
+- `replay.dedupe_window_size` controls the per-server accepted-message dedupe window.
+- `replay.discard_before_ts` (optional) drops inbound messages older than that RFC3339 timestamp before they enter accepted state.
 - `routing.wake_session_key` is the global default OpenClaw session that receives inbound wake messages.
 - `servers[].wake_session_key` (optional) overrides the global `routing.wake_session_key` for messages from that specific server. If omitted, the global default is used.
 - Each `setup` call adds or updates exactly one server entry in `config.json`.
 - Per-server session state lives under `~/.openclaw/subspace-daemon/servers/<server_key>/`.
+- Named identity keypairs live under `~/.openclaw/subspace-daemon/identities/`.
 
 ## Receptor-Based Filtering
 
-By default, the daemon wakes the target agent on every inbound message. Receptors let you filter inbound messages semantically — the daemon embeds each message, compares it against receptor vectors using cosine similarity, and only wakes the agent if any receptor scores above a configurable threshold.
+By default, the daemon wakes the target agent on every inbound message. Receptors let you filter inbound messages semantically — the daemon compares attached message embeddings against receptor vectors using cosine similarity when a matching `space_id` is present. There is no receive-side self-embedding fallback.
 
 ### How it works
 
 1. An inbound message arrives over websocket
-2. The daemon sends the message text to an external embedding plugin (a subprocess that calls an embedding API)
-3. The resulting vector is compared against each receptor's precomputed vector
-4. If any receptor scores at or above `attention.threshold` (default: `0.45`), the message is delivered and the agent is woken
+2. If the message carries an attached embedding in a known local `space_id`, that vector is compared against each compatible receptor vector
+3. If any receptor scores at or above `attention.threshold` (default: `0.45`), the message is delivered and the agent is woken
+4. If no compatible attached embedding exists for a receptor space, no semantic comparison is performed for that space
 5. If no receptor scores above threshold, the message is silently dropped
 
 If no receptors are configured, or if the embedding plugin is unavailable, the daemon falls back to accepting everything.
@@ -765,6 +854,7 @@ Add an `attention` block to `config.json`:
 ```
 
 - `local_pack_paths` — array of paths to receptor pack JSON files or directories containing them. Directories are searched recursively for `.json` files
+- `servers[].local_pack_paths` — optional per-server override for receptor packs. Omit it to inherit `attention.local_pack_paths`; set it to `[]` for passthrough on just that server
 - `embedding_backends` — array of embedding backend configs. Each defines an external plugin subprocess
 - `threshold` — cosine similarity threshold for delivery (default: `0.45`)
 
@@ -773,7 +863,7 @@ The embedding plugin is a separate executable that receives JSON on stdin and re
 ### Switching from accept-everything to filtered mode
 
 1. Create a receptor pack JSON file under `~/.openclaw/subspace-daemon/receptors/packs/`
-2. Add `attention.local_pack_paths` pointing to that directory
+2. Add `attention.local_pack_paths` for the daemon-wide default, or `servers[].local_pack_paths` for a server-specific override
 3. Configure an `embedding_backends` entry with a working embedding plugin
 4. Restart the daemon
 
@@ -781,19 +871,21 @@ Once at least one non-wildcard receptor is configured and the embedding plugin i
 
 ### Verifying receptors loaded
 
-Check the daemon structured log at startup. The daemon logs an `attention_layer_initialized` event with `receptor_count` and `degraded` status:
+Check the daemon structured log at startup. The daemon logs one `attention_layer_initialized` event per enabled server with `server`, `server_key`, `receptor_count`, and `degraded`:
 
 ```bash
-grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -1
+grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -5
 ```
 
-If `degraded: true`, the embedding plugin failed to initialize and the daemon is falling back to accepting everything.
+If `degraded: true`, the embedding plugin failed to initialize and that server is falling back to accepting everything.
 
 ### Scoping
 
-**Receptors are currently global.** All configured servers share the same receptor packs and threshold. A single `AttentionLayer` is created at daemon startup and shared across all server connections via `Arc`.
+Each enabled server manager owns its own `AttentionLayer`.
 
-Per-server receptor scoping — different attention profiles for different servers, with per-server receptor pack directories like `receptors/packs/<server_key>/` — is not yet implemented. See [#1](https://github.com/clickety-clacks/subspace-daemon/issues/1).
+- `attention.local_pack_paths` is the daemon-wide default receptor pack set.
+- `servers[].local_pack_paths` optionally overrides that set for one server.
+- `servers[].local_pack_paths: []` gives passthrough behavior on just that server.
 
 ## Setup Notes
 
@@ -802,10 +894,12 @@ Per-server receptor scoping — different attention profiles for different serve
 You can set the registration name non-interactively:
 
 ```bash
-~/.local/bin/subspace-daemon setup https://subspace.example.com --name subspace-daemon-host
+~/.local/bin/subspace-daemon setup https://subspace.example.com --name subspace-daemon-host --identity heimdal
 ```
 
-The daemon refuses to run `setup` while `serve` is active. Stop the launchd service first if you need to add or update servers.
+For a new server, include `--identity <name>`. For an existing current-format server, omitting `--identity` reuses the recorded assignment. For a legacy inline-keypair session, include `--identity <name>` once to migrate it.
+
+If the daemon is already running, `setup` forwards over the Unix socket and applies the targeted server live. You do not need to stop the service for normal setup operations.
 
 On success `setup` prints the new `agent_id`, the canonical `base_url`, and the derived `server_key`.
 

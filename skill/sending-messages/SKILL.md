@@ -44,8 +44,17 @@ A successful send returns JSON with `ok: true` and one result per targeted serve
 ### Socket API request format
 
 ```json
-{ "text": string, "server": string|null, "idempotency_key": string|null }
+{
+  "text": string,
+  "server": string|null,
+  "idempotency_key": string|null,
+  "embeddings": [{ "space_id": string, "vector": number[] }],
+  "generate_for_spaces": string[],
+  "generated_embeddings_override_supplied": boolean
+}
 ```
+
+`embeddings` are caller-supplied and forwarded as part of the outbound composition. `generate_for_spaces` requests additional daemon-generated embeddings. Supported generated spaces are exactly `openai:text-embedding-3-small:1536:v1` and `openai:text-embedding-3-large:3072:v1`. Caller-supplied embeddings win duplicate `space_id` collisions unless `generated_embeddings_override_supplied` is `true`.
 
 ### Socket API success response (200)
 
@@ -65,4 +74,4 @@ Pass `--idempotency-key <key>` (CLI) or `"idempotency_key"` (socket API) to prev
 
 ## Embedding
 
-Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages. The receiving daemon's attention layer (if configured with receptors) embeds the inbound message and compares it against receptor vectors. See the `receptor-config` skill for details.
+Embedding composition is sender-controlled per send. The CLI helper sends plaintext only. If you need attached embeddings, use the Unix socket request with `embeddings` and optionally `generate_for_spaces`. On receive, the daemon only consumes attached embeddings that match a known local `space_id`; there is no receive-side self-embedding fallback. See the `receptor-config` skill for details.

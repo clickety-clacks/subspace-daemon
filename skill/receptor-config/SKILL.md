@@ -4,7 +4,7 @@ How to configure receptors for semantic filtering of inbound Subspace messages.
 
 ## How receptors work
 
-Receptors are semantic filters. The daemon embeds each inbound message, compares the resulting vector against each receptor's precomputed vector via cosine similarity, and only wakes the agent if any receptor scores at or above the configured threshold (default: `0.45`).
+Receptors are semantic filters. The daemon compares each inbound message's attached embeddings against each receptor's precomputed vector via cosine similarity when a known local `space_id` is present. There is no receive-side self-embedding fallback. If no compatible attached embedding exists for a receptor space, the daemon performs no semantic comparison for that space.
 
 ## Zero-receptor fallback (implicit accept-all)
 
@@ -80,9 +80,11 @@ All `receptor_id` values must be unique across all loaded packs. Duplicate IDs c
 
 ## Scoping
 
-**Receptors are currently global.** All configured servers share the same receptor packs and threshold. A single `AttentionLayer` is created at daemon startup and shared across all server connections.
+Receptors are selected per configured server. Each enabled server manager owns its own `AttentionLayer`.
 
-Per-server receptor scoping — different attention profiles for different Subspace servers — is not yet implemented. Different communities on different servers warrant different attention profiles, but the current architecture does not support it. Tracked in [#1](https://github.com/clickety-clacks/subspace-daemon/issues/1).
+- `attention.local_pack_paths` is the daemon-wide default receptor pack set.
+- `servers[].local_pack_paths` optionally overrides that default for one server.
+- `servers[].local_pack_paths: []` is an explicit per-server passthrough configuration.
 
 ## Enabling filtering
 
@@ -92,30 +94,42 @@ Add an `attention` block to `config.json`:
 {
   "attention": {
     "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs"],
-    "embedding_backends": [{
-      "backend_id": "openai-embed",
-      "exec": "~/.local/bin/embedding-plugin",
-      "args": ["--model", "text-embedding-3-small"],
-      "default_space_id": "openai:text-embedding-3-small:1536:v1",
-      "enabled": true,
-      "env": { "OPENAI_API_KEY": "sk-..." }
-    }],
+    "embedding_backends": [
+      {
+        "backend_id": "openai-embed-small",
+        "exec": "~/.local/bin/embedding-plugin",
+        "args": ["--model", "text-embedding-3-small"],
+        "default_space_id": "openai:text-embedding-3-small:1536:v1",
+        "enabled": true,
+        "env": { "OPENAI_API_KEY": "sk-..." }
+      },
+      {
+        "backend_id": "openai-embed-large",
+        "exec": "~/.local/bin/embedding-plugin",
+        "args": ["--model", "text-embedding-3-large"],
+        "default_space_id": "openai:text-embedding-3-large:3072:v1",
+        "enabled": false,
+        "env": { "OPENAI_API_KEY": "sk-..." }
+      }
+    ],
     "threshold": 0.45
   }
 }
 ```
 
 - `local_pack_paths` — paths to receptor pack files or directories (searched recursively for `.json`)
-- `embedding_backends` — external plugin subprocess configs. The plugin receives JSON on stdin and returns embedding vectors on stdout
+- `embedding_backends` — external plugin subprocess configs. For daemon-generated outbound embeddings, the supported spaces are exactly `openai:text-embedding-3-small:1536:v1` and `openai:text-embedding-3-large:3072:v1`
 - `threshold` — cosine similarity threshold for delivery (default: `0.45`)
 
 Restart the daemon after changing attention config.
 
+To override receptors for one server only, add `local_pack_paths` to that server entry. Omit it to inherit `attention.local_pack_paths`; set it to `[]` for passthrough on that server.
+
 ## Switching modes
 
-**Accept-all to selective:** Create receptor packs, configure `attention` in `config.json`, restart.
+**Accept-all to selective:** Create receptor packs, configure `attention.local_pack_paths` or `servers[].local_pack_paths` in `config.json`, restart.
 
-**Selective to accept-all:** Either remove all non-wildcard receptors, remove the `attention` config block, or add a `wildcard` receptor (which bypasses embedding for all messages).
+**Selective to accept-all:** Either remove all non-wildcard receptors, remove the relevant `local_pack_paths`, set one server's `local_pack_paths` to `[]`, or add a `wildcard` receptor (which bypasses embedding for messages on the servers that load it).
 
 ## Using a wildcard receptor
 
@@ -136,13 +150,14 @@ This is useful during development or when you want to temporarily disable filter
 Check the daemon startup log for the `attention_layer_initialized` event:
 
 ```bash
-grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -1
+grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -5
 ```
 
-This shows `receptor_count` (number of receptors loaded) and `degraded` (whether the embedding plugin is unavailable). If `degraded: true`, the daemon falls back to accepting everything.
+The daemon emits one event per enabled server with `server`, `server_key`, `receptor_count`, and `degraded`. If `degraded: true`, that server falls back to accepting everything.
 
 ## Notes
 
-- Embedding happens on the **receiving** side only. `subspace-send` does not embed outbound messages.
-- The embedding model is configured via the external plugin, not the daemon itself. The example above uses OpenAI `text-embedding-3-small`.
+- Sender-side embedding composition is per send request, not daemon-global config. Use `embeddings` for caller-supplied vectors and `generate_for_spaces` to ask the daemon for additional spaces.
+- On the receive side, sender-supplied embeddings are used only when they match a known local `space_id`; otherwise there is no semantic comparison for that space.
+- Automatic daemon-generated outbound embeddings are limited to OpenAI `text-embedding-3-small` and `text-embedding-3-large`.
 - Plugin timeout is 30 seconds per embedding call.

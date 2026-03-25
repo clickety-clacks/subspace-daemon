@@ -31,11 +31,64 @@ pub mod client {
         pub error: Option<Value>,
     }
 
+    #[derive(Debug, Deserialize, Serialize, Clone, Default)]
+    pub struct ClientSendRequest {
+        pub text: String,
+        #[serde(default)]
+        pub idempotency_key: Option<String>,
+        #[serde(default)]
+        pub server: Option<String>,
+        #[serde(default)]
+        pub embeddings: Vec<crate::attention::MessageEmbedding>,
+        #[serde(default)]
+        pub generate_for_spaces: Vec<String>,
+        #[serde(default)]
+        pub generated_embeddings_override_supplied: bool,
+    }
+
+    pub async fn setup_via_socket(
+        socket_path: &std::path::Path,
+        request: &crate::setup::SetupRequest,
+    ) -> Result<crate::setup::SetupResult> {
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .with_context(|| format!("failed connecting to {}", socket_path.display()))?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = http1::handshake(io).await?;
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                tracing::debug!(error = %err, "ipc client connection ended");
+            }
+        });
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/v1/setup")
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(serde_json::to_vec(request)?)))?;
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let body = response.into_body().collect().await?.to_bytes();
+        if status != StatusCode::OK {
+            return Err(anyhow!(
+                "daemon returned {}: {}",
+                status,
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        let parsed: crate::setup::SetupResult =
+            serde_json::from_slice(&body).with_context(|| {
+                format!(
+                    "failed parsing daemon response: {}",
+                    String::from_utf8_lossy(&body)
+                )
+            })?;
+        Ok(parsed)
+    }
+
     pub async fn send_via_socket(
         socket_path: &std::path::Path,
-        text: &str,
-        idempotency_key: Option<&str>,
-        server: Option<&str>,
+        request: &ClientSendRequest,
     ) -> Result<ClientResponse> {
         let stream = UnixStream::connect(socket_path)
             .await
@@ -49,9 +102,12 @@ pub mod client {
         });
 
         let body = json!({
-            "text": text,
-            "server": server,
-            "idempotency_key": idempotency_key.map(ToOwned::to_owned).unwrap_or_else(|| Uuid::new_v4().to_string()),
+            "text": request.text,
+            "server": request.server,
+            "idempotency_key": request.idempotency_key.clone().unwrap_or_else(|| Uuid::new_v4().to_string()),
+            "embeddings": request.embeddings,
+            "generate_for_spaces": request.generate_for_spaces,
+            "generated_embeddings_override_supplied": request.generated_embeddings_override_supplied,
         });
         let request = Request::builder()
             .method(Method::POST)
@@ -78,7 +134,6 @@ pub mod client {
     }
 }
 
-use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,8 +151,9 @@ use tokio::net::UnixListener;
 use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
+use crate::attention::{MessageEmbedding, OutboundEmbeddingRequest, validate_generated_spaces};
 use crate::config::canonicalize_base_url;
-use crate::subspace::client::ServerHandle;
+use crate::setup::{LiveSetupState, SetupRequest, perform_setup};
 use crate::supervisor::{DaemonStatus, ServerSendResultEnvelope};
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +163,12 @@ struct SendRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     server: Option<String>,
+    #[serde(default)]
+    embeddings: Vec<MessageEmbedding>,
+    #[serde(default)]
+    generate_for_spaces: Vec<String>,
+    #[serde(default)]
+    generated_embeddings_override_supplied: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,11 +202,14 @@ struct SendBody {
 #[derive(Clone)]
 pub struct SendRouter {
     status: Arc<RwLock<DaemonStatus>>,
-    handles: BTreeMap<String, ServerHandle>,
+    handles: crate::setup::SharedServerHandles,
 }
 
 impl SendRouter {
-    pub fn new(status: Arc<RwLock<DaemonStatus>>, handles: BTreeMap<String, ServerHandle>) -> Self {
+    pub fn new(
+        status: Arc<RwLock<DaemonStatus>>,
+        handles: crate::setup::SharedServerHandles,
+    ) -> Self {
         Self { status, handles }
     }
 
@@ -153,14 +218,16 @@ impl SendRouter {
         text: String,
         idempotency_key: Option<String>,
         server: Option<String>,
+        embedding_request: OutboundEmbeddingRequest,
     ) -> std::result::Result<Vec<ServerSendResultEnvelope>, SendRouteError> {
         let snapshot = self.status.read().await.clone();
+        let handles = self.handles.read().await.clone();
         let targets = match server {
             Some(server) => {
                 let canonical = canonicalize_base_url(&server).map_err(|err| {
                     SendRouteError::invalid_request(format!("invalid server url: {err}"))
                 })?;
-                if !self.handles.contains_key(&canonical) {
+                if !handles.contains_key(&canonical) {
                     return Err(SendRouteError::unknown_server());
                 }
                 vec![canonical]
@@ -190,12 +257,15 @@ impl SendRouter {
 
         let mut results = Vec::with_capacity(targets.len());
         for target in targets {
-            let handle = self
-                .handles
+            let handle = handles
                 .get(&target)
                 .ok_or_else(|| SendRouteError::unknown_server())?;
             match handle
-                .send_message(text.clone(), idempotency_key.clone())
+                .send_message(
+                    text.clone(),
+                    idempotency_key.clone(),
+                    embedding_request.clone(),
+                )
                 .await
             {
                 Ok(result) => results.push(ServerSendResultEnvelope {
@@ -273,6 +343,7 @@ pub async fn run_ipc_server(
     socket_path: PathBuf,
     status: Arc<RwLock<DaemonStatus>>,
     send_router: SendRouter,
+    setup_state: LiveSetupState,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -299,8 +370,11 @@ pub async fn run_ipc_server(
                 let io = TokioIo::new(stream);
                 let status = status.clone();
                 let send_router = send_router.clone();
+                let setup_state = setup_state.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |req| handle_request(req, status.clone(), send_router.clone()));
+                    let service = service_fn(move |req| {
+                        handle_request(req, status.clone(), send_router.clone(), setup_state.clone())
+                    });
                     if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                         let is_benign = err.is_incomplete_message()
                             || err.is_closed()
@@ -324,6 +398,7 @@ async fn handle_request(
     req: Request<Incoming>,
     status: Arc<RwLock<DaemonStatus>>,
     send_router: SendRouter,
+    setup_state: LiveSetupState,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let response = match (req.method(), req.uri().path()) {
         (&Method::GET, "/healthz") => {
@@ -371,8 +446,32 @@ async fn handle_request(
                     Vec::new(),
                 ));
             }
+            if let Err(err) = validate_embedding_request(&payload) {
+                warn!(
+                    component = "ipc",
+                    event = "ipc_outbound_rejected",
+                    reason = %err,
+                    "invalid outbound embedding request"
+                );
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    err,
+                    Vec::new(),
+                ));
+            }
             match send_router
-                .send(payload.text, payload.idempotency_key, payload.server)
+                .send(
+                    payload.text,
+                    payload.idempotency_key,
+                    payload.server,
+                    OutboundEmbeddingRequest {
+                        embeddings: payload.embeddings,
+                        generate_for_spaces: payload.generate_for_spaces,
+                        generated_embeddings_override_supplied: payload
+                            .generated_embeddings_override_supplied,
+                    },
+                )
                 .await
             {
                 Ok(results) => {
@@ -396,6 +495,29 @@ async fn handle_request(
                 }
             }
         }
+        (&Method::POST, "/v1/setup") => {
+            let body_bytes = req.into_body().collect().await?.to_bytes();
+            let payload: SetupRequest = match serde_json::from_slice(&body_bytes) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        format!("invalid json: {err}"),
+                        Vec::new(),
+                    ));
+                }
+            };
+            match perform_setup(payload, Some(setup_state)).await {
+                Ok(result) => json_response(StatusCode::OK, &result),
+                Err(err) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    err.to_string(),
+                    Vec::new(),
+                ),
+            }
+        }
         _ => error_response(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -404,6 +526,21 @@ async fn handle_request(
         ),
     };
     Ok(response)
+}
+
+fn validate_embedding_request(payload: &SendRequest) -> std::result::Result<(), String> {
+    for embedding in &payload.embeddings {
+        if embedding.space_id.trim().is_empty() {
+            return Err("embeddings[].space_id must not be empty".to_string());
+        }
+        if embedding.vector.is_empty() {
+            return Err(format!(
+                "embeddings[{}].vector must not be empty",
+                embedding.space_id
+            ));
+        }
+    }
+    validate_generated_spaces(&payload.generate_for_spaces).map_err(|err| err.to_string())
 }
 
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {

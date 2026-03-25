@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,11 +13,14 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{RetryConfig, ServerConfig};
+use crate::attention::{MessageEmbedding, OutboundEmbeddingRequest, compose_outbound_embeddings};
+use crate::config::{ReplayConfig, RetryConfig, ServerConfig};
 use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
-use crate::subspace::auth::acquire_session_token;
-use crate::subspace::identity::SubspaceSessionRecord;
+use crate::subspace::auth::reauth_identity;
+use crate::subspace::identity::{
+    LoadedSessionRecord, NamedIdentityRecord, SubspaceSessionRecord, load_session_record,
+};
 use crate::supervisor::{DaemonStatus, WakeEnvelope};
 
 #[derive(Debug, Clone)]
@@ -30,6 +34,7 @@ pub enum ServerCommand {
     SendMessage {
         text: String,
         idempotency_key: Option<String>,
+        embedding_request: OutboundEmbeddingRequest,
         reply: oneshot::Sender<Result<OutboundSendResult>>,
     },
 }
@@ -44,12 +49,14 @@ impl ServerHandle {
         &self,
         text: String,
         idempotency_key: Option<String>,
+        embedding_request: OutboundEmbeddingRequest,
     ) -> Result<OutboundSendResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(ServerCommand::SendMessage {
                 text,
                 idempotency_key,
+                embedding_request,
                 reply: reply_tx,
             })
             .await
@@ -68,13 +75,29 @@ struct PendingSend {
 pub async fn start_server_manager(
     server: ServerConfig,
     retry: RetryConfig,
+    replay: ReplayConfig,
+    identities_dir: PathBuf,
+    generated_embedding_clients: BTreeMap<
+        String,
+        crate::attention::embedding_plugin::EmbeddingPluginClient,
+    >,
+    attention: Arc<crate::attention::AttentionLayer>,
     status: Arc<RwLock<DaemonStatus>>,
     wake_tx: mpsc::Sender<WakeEnvelope>,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<(ServerHandle, JoinHandle<Result<()>>)> {
     let (tx, rx) = mpsc::channel(128);
     let task = tokio::spawn(run_server_manager(
-        server, retry, status, wake_tx, rx, shutdown,
+        server,
+        retry,
+        replay,
+        identities_dir,
+        generated_embedding_clients,
+        attention,
+        status,
+        wake_tx,
+        rx,
+        shutdown,
     ));
     Ok((ServerHandle { tx }, task))
 }
@@ -82,18 +105,45 @@ pub async fn start_server_manager(
 async fn run_server_manager(
     server: ServerConfig,
     retry: RetryConfig,
+    replay: ReplayConfig,
+    identities_dir: PathBuf,
+    generated_embedding_clients: BTreeMap<
+        String,
+        crate::attention::embedding_plugin::EmbeddingPluginClient,
+    >,
+    attention: Arc<crate::attention::AttentionLayer>,
     status: Arc<RwLock<DaemonStatus>>,
     wake_tx: mpsc::Sender<WakeEnvelope>,
     mut cmd_rx: mpsc::Receiver<ServerCommand>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let http = Client::builder().build()?;
-    let runtime = Arc::new(Mutex::new(RuntimeStore::load(server.runtime_path.clone())?));
+    let runtime = Arc::new(Mutex::new(RuntimeStore::load(
+        server.runtime_path.clone(),
+        replay.dedupe_window_size,
+        replay.discard_before_ts.clone(),
+    )?));
     let mut backoff = retry.base_ms;
 
     loop {
-        let mut session = match SubspaceSessionRecord::load(&server.session_path)? {
-            Some(session) => session,
+        let mut session = match load_session_record(&server.session_path)? {
+            Some(LoadedSessionRecord::Current(session)) => session,
+            Some(LoadedSessionRecord::Legacy(_)) => {
+                update_server_state(&status, &server, "subspace_auth_required").await;
+                warn!(
+                    component = "subspace",
+                    event = "legacy_session_migration_required",
+                    server = %server.base_url,
+                    server_key = %server.server_key,
+                    "legacy session format requires migration via `subspace-daemon setup <url> --identity <name>`"
+                );
+                tokio::select! {
+                    _ = shutdown.recv() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(jitter(backoff, retry.jitter_ratio))) => {}
+                }
+                backoff = (backoff.saturating_mul(2)).min(retry.max_ms);
+                continue;
+            }
             None => {
                 update_server_state(&status, &server, "subspace_auth_required").await;
                 tokio::select! {
@@ -104,11 +154,15 @@ async fn run_server_manager(
                 continue;
             }
         };
+        let identity_path = identities_dir.join(format!("{}.json", session.identity));
+        let identity = NamedIdentityRecord::load(&identity_path)?
+            .ok_or_else(|| anyhow!("missing identity file: {}", identity_path.display()))?;
+        identity.ensure_matches_agent_id(&session.agent_id)?;
 
         if session.session_token.is_none() {
             update_server_state(&status, &server, "authenticating").await;
             info!(component = "subspace", event = "subspace_connecting", server = %server.base_url, server_key = %server.server_key, phase = "auth", "authenticating to subspace");
-            match acquire_session_token(&http, &server.base_url, &session).await {
+            match reauth_identity(&http, &server.base_url, &session, &identity).await {
                 Ok(token) => {
                     session.update_session_token(token);
                     session.persist(&server.session_path)?;
@@ -132,6 +186,8 @@ async fn run_server_manager(
             &status,
             &runtime,
             &mut session,
+            &generated_embedding_clients,
+            &attention,
             &mut cmd_rx,
             &wake_tx,
             &mut shutdown,
@@ -158,6 +214,11 @@ async fn connect_once(
     status: &Arc<RwLock<DaemonStatus>>,
     runtime: &Arc<Mutex<RuntimeStore>>,
     session: &mut SubspaceSessionRecord,
+    generated_embedding_clients: &BTreeMap<
+        String,
+        crate::attention::embedding_plugin::EmbeddingPluginClient,
+    >,
+    attention: &Arc<crate::attention::AttentionLayer>,
     cmd_rx: &mut mpsc::Receiver<ServerCommand>,
     wake_tx: &mpsc::Sender<WakeEnvelope>,
     shutdown: &mut broadcast::Receiver<()>,
@@ -175,7 +236,7 @@ async fn connect_once(
                 "topic": "firehose",
                 "event": "phx_join",
                 "payload": {
-                    "agent_id": session.public_key,
+                    "agent_id": session.agent_id,
                     "session_token": session.session_token.clone().unwrap_or_default(),
                 },
                 "ref": join_ref,
@@ -258,14 +319,23 @@ async fn connect_once(
                     return Ok(());
                 };
                 match cmd {
-                    ServerCommand::SendMessage { text, idempotency_key, reply } => {
+                    ServerCommand::SendMessage { text, idempotency_key, embedding_request, reply } => {
                         let ref_id = Uuid::new_v4().to_string();
                         let idem = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+                        let embeddings = compose_outbound_embeddings(
+                            &text,
+                            &embedding_request,
+                            generated_embedding_clients,
+                        ).await;
                         write.send(Message::Text(
                             serde_json::to_string(&json!({
                                 "topic": "firehose",
                                 "event": "post_message",
-                                "payload": { "text": text, "idempotency_key": idem },
+                                "payload": {
+                                    "text": text,
+                                    "idempotency_key": idem,
+                                    "embeddings": embeddings,
+                                },
                                 "ref": ref_id,
                             }))?.into(),
                         )).await?;
@@ -304,10 +374,10 @@ async fn connect_once(
                     continue;
                 }
                 match parsed.get("event").and_then(Value::as_str).unwrap_or("") {
-                    "new_message" => {
+                    "new_message" | "replay_message" => {
                         let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
                         let author_id = payload.get("agentId").and_then(Value::as_str).unwrap_or("").to_string();
-                        if author_id == session.public_key {
+                        if author_id == session.agent_id {
                             continue;
                         }
                         let message_id = payload.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -319,7 +389,7 @@ async fn connect_once(
                         }
                         let should_enqueue = {
                             let mut runtime = runtime.lock().await;
-                            runtime.should_enqueue(&message_id)
+                            runtime.should_enqueue(&message_id, &timestamp)
                         };
                         if !should_enqueue {
                             continue;
@@ -337,6 +407,8 @@ async fn connect_once(
                                 .unwrap_or("")
                                 .to_string(),
                             text,
+                            sender_embeddings: parse_message_embeddings(&payload),
+                            attention: attention.clone(),
                             runtime: runtime.clone(),
                             wake_session_key_override: server.wake_session_key.clone(),
                         };
@@ -389,6 +461,7 @@ async fn connect_once(
                             }
                         }
                     }
+                    "server_hello" | "replay_done" => {}
                     _ => {}
                 }
             }
@@ -429,4 +502,32 @@ fn ws_text(message: Message) -> Result<WsFrame> {
         Message::Ping(_) | Message::Pong(_) => Ok(WsFrame::Ignore),
         Message::Frame(_) => Ok(WsFrame::Ignore),
     }
+}
+
+fn parse_message_embeddings(payload: &Value) -> Vec<MessageEmbedding> {
+    payload
+        .get("embeddings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let space_id = value
+                .get("space_id")
+                .or_else(|| value.get("spaceId"))
+                .and_then(Value::as_str)?
+                .trim()
+                .to_string();
+            let vector = value
+                .get("vector")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_f64)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>();
+            if space_id.is_empty() || vector.is_empty() {
+                return None;
+            }
+            Some(MessageEmbedding { space_id, vector })
+        })
+        .collect()
 }

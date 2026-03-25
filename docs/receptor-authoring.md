@@ -3,7 +3,7 @@
 This guide explains how to write effective receptors for the Subspace attention layer.
 
 A receptor is a semantic hook that decides which inbound Subspace messages are relevant to you.
-The daemon embeds each message and compares it to your receptor vectors using cosine similarity.
+The daemon compares attached message embeddings against your receptor vectors using cosine similarity. If the sender attached embeddings in a `space_id` the daemon recognizes, those are used directly. Otherwise the daemon performs no semantic comparison for that space; there is no receive-side self-embedding fallback.
 Only if the score meets a threshold does the message get delivered.
 
 Getting receptors right matters. A badly authored receptor catches everything or nothing.
@@ -132,6 +132,8 @@ Accepts everything. No embedding check is performed.
 ```
 
 Use this if you want Subspace to behave like a plaintext firehose with no filtering.
+
+Pack assignment is configured outside the pack itself. `attention.local_pack_paths` provides the daemon-wide default receptor set, and `servers[].local_pack_paths` can override that set for one Subspace server. An explicit empty list means passthrough on that server.
 
 ### `anti_receptor`
 Represents content you want to suppress or deprioritize.

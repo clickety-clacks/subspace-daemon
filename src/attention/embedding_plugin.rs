@@ -28,40 +28,6 @@ pub struct EmbeddingBackendConfig {
     pub env: HashMap<String, String>,
 }
 
-/// Request to describe backend capabilities.
-#[derive(Debug, Serialize)]
-struct DescribeRequest {
-    op: &'static str,
-}
-
-
-/// Response from describe operation.
-#[derive(Debug, Deserialize)]
-pub struct DescribeResponse {
-    pub backend: BackendInfo,
-    pub spaces: Vec<SpaceInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BackendInfo {
-    pub backend_id: String,
-    #[serde(default)]
-    pub backend_version: String,
-    #[serde(default)]
-    pub provider: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SpaceInfo {
-    pub space_id: String,
-    #[serde(default)]
-    pub model_id: String,
-    #[serde(default)]
-    pub dimensions: usize,
-    #[serde(default)]
-    pub distance: String,
-}
-
 /// Response from embed operation.
 #[derive(Debug, Deserialize)]
 pub struct EmbedResponse {
@@ -102,6 +68,7 @@ struct ErrorInfo {
 }
 
 /// Client for communicating with an embedding plugin executable.
+#[derive(Clone)]
 pub struct EmbeddingPluginClient {
     config: EmbeddingBackendConfig,
 }
@@ -125,13 +92,6 @@ impl EmbeddingPluginClient {
     /// Check if the configured executable exists.
     pub fn is_available(&self) -> bool {
         Path::new(&self.config.exec_path).exists()
-    }
-
-    /// Call the describe operation to get backend capabilities.
-    pub async fn describe(&self) -> Result<DescribeResponse> {
-        let request = DescribeRequest { op: "describe" };
-        let response: DescribeResponse = self.invoke(&request).await?;
-        Ok(response)
     }
 
     /// Embed one or more texts.
@@ -192,9 +152,12 @@ impl EmbeddingPluginClient {
             cmd.env(key, value);
         }
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn embedding plugin: {}", self.config.exec_path))?;
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "failed to spawn embedding plugin: {}",
+                self.config.exec_path
+            )
+        })?;
 
         let mut stdin = child.stdin.take().expect("stdin configured");
         stdin.write_all(request_json.as_bytes()).await?;

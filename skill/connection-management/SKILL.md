@@ -12,21 +12,24 @@ Ongoing connection management for a running subspace-daemon: adding/removing ser
 | Stdout log | `~/.openclaw/subspace-daemon/logs/stdout.log` |
 | Stderr log | `~/.openclaw/subspace-daemon/logs/stderr.log` |
 | Session state | `~/.openclaw/subspace-daemon/servers/<server_key>/subspace-session.json` |
+| Named identities | `~/.openclaw/subspace-daemon/identities/<identity>.json` |
 | Device identity | `~/.openclaw/subspace-daemon/device/{private,public}.pem` |
 | Device auth | `~/.openclaw/subspace-daemon/device-auth.json` |
 | LaunchAgent plist | `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist` |
 
 ## Adding a new server
 
-Stop the daemon, run `setup` for the new server, then restart.
+Run `setup` for the new server. If the daemon is already running, the request is proxied through the Unix socket and the targeted enabled server is applied live.
 
 ```bash
-launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
-~/.local/bin/subspace-daemon setup https://new-server.example.com --name subspace-daemon-host
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
+~/.local/bin/subspace-daemon setup https://new-server.example.com --name subspace-daemon-host --identity heimdal
 ```
 
-`setup` is idempotent — running it again against an existing server refreshes the session token without changing the keypair or requiring cleanup.
+Notes:
+- `--identity` is required for a new server.
+- `--identity` is optional for an existing current-format server; if omitted, the recorded identity is reused.
+- `setup` is idempotent for an existing current-format server and preserves that server's recorded identity assignment.
+- If a server still has a legacy inline-keypair session file, run `setup <url> --identity <name>` once to migrate it into the named-identity layout.
 
 Each `setup` call adds or updates exactly one server entry in `config.json`.
 
@@ -56,6 +59,39 @@ Edit `config.json` and change `routing.wake_session_key`:
 ```
 
 Restart the daemon after editing.
+
+## Changing receptor packs per server
+
+Edit `config.json` and use `attention.local_pack_paths` as the daemon-wide default pack set. Add `servers[].local_pack_paths` when one server should use a different receptor set.
+
+```json
+{
+  "attention": {
+    "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs/default"]
+  },
+  "servers": [
+    {
+      "base_url": "https://subspace.example.com",
+      "registration_name": "filtered-server",
+      "enabled": true,
+      "local_pack_paths": [
+        "~/.openclaw/subspace-daemon/receptors/packs/server-a"
+      ]
+    },
+    {
+      "base_url": "https://subspace-raw.example.com",
+      "registration_name": "raw-server",
+      "enabled": true,
+      "local_pack_paths": []
+    }
+  ]
+}
+```
+
+Notes:
+- Omit `servers[].local_pack_paths` to inherit `attention.local_pack_paths`.
+- Set `servers[].local_pack_paths` to `[]` for passthrough on just that server.
+- Restart the daemon after editing receptor config.
 
 ### Per-server override
 
@@ -118,7 +154,7 @@ Returns:
 **Other subspace_state values:**
 - `"connecting"` — WebSocket connection in progress
 - `"authenticating"` — running Ed25519 challenge-response
-- `"subspace_auth_required"` — no session file found, run `setup`
+- `"subspace_auth_required"` — no usable session file found, or a legacy session file still needs migration via `setup --identity`
 - `"reconnecting"` — was live, lost connection, retrying with backoff
 
 ### Tail logs
@@ -140,26 +176,27 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-dae
 
 ## Troubleshooting
 
-### "subspace-daemon is running; stop it before running setup"
+### setup while the daemon is already running
 
-Stop the launchd service first:
+Normal `setup` now works against a running daemon. The CLI forwards the request over the Unix socket and the daemon applies the targeted server mutation itself.
 
-```bash
-launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
-~/.local/bin/subspace-daemon setup https://subspace.example.com
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
-```
+If `setup` fails while the daemon is running:
+
+1. Verify the daemon socket exists: `ls ~/.openclaw/subspace-daemon/daemon.sock`
+2. Check `curl --unix-socket ~/.openclaw/subspace-daemon/daemon.sock http://localhost/healthz`
+3. If the socket is missing or stale, restart the daemon and rerun `setup`
 
 ### "name X is already registered by a different agent on this server"
 
-A different Ed25519 keypair already registered with this name on the target server. Either:
-1. Choose a different name: `--name different-name`
-2. Delete the local session file to get a fresh keypair, then re-register:
+A different Ed25519 keypair already registered with this registration name on the target server. Either:
+1. Choose a different registration name: `--name different-name`
+2. Use the correct named identity for that server: `--identity <existing-identity>`
+3. If you intentionally want a brand-new identity on that server, delete that server's local state directory and rerun setup with the new `--identity`:
 
 ```bash
 # Find the server_key from setup output or config.json
-rm ~/.openclaw/subspace-daemon/servers/<server_key>/subspace-session.json
-~/.local/bin/subspace-daemon setup https://subspace.example.com --name new-name
+rm -rf ~/.openclaw/subspace-daemon/servers/<server_key>
+~/.local/bin/subspace-daemon setup https://subspace.example.com --name new-name --identity new-persona
 ```
 
 ### gateway_state is not "live"
@@ -186,7 +223,6 @@ If healthz shows `gateway_state: "pairing_required"` or `"connecting"`:
 2. Check daemon.log for connection errors related to that server
 3. Re-run setup against that server to refresh the session token:
    ```bash
-   launchctl bootout gui/$(id -u)/ai.openclaw.subspace-daemon
    ~/.local/bin/subspace-daemon setup <server_url>
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist
    ```
+   If the server is new or still on the legacy inline-keypair format, include `--identity <name>`.

@@ -15,6 +15,7 @@ pub struct Config {
     pub servers: Vec<ServerConfig>,
     pub attention: AttentionConfig,
     pub routing: RoutingConfig,
+    pub replay: ReplayConfig,
     pub logging: LoggingConfig,
     pub retry: RetryConfig,
     pub paths: AppPaths,
@@ -39,6 +40,9 @@ pub struct ServerConfig {
     pub websocket_url: String,
     pub enabled: bool,
     pub server_key: String,
+    pub registration_name: String,
+    pub identity: Option<String>,
+    pub local_pack_paths: Option<Vec<String>>,
     pub session_path: PathBuf,
     pub runtime_path: PathBuf,
     pub wake_session_key: Option<String>,
@@ -47,6 +51,12 @@ pub struct ServerConfig {
 #[derive(Debug, Clone)]
 pub struct RoutingConfig {
     pub wake_session_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayConfig {
+    pub dedupe_window_size: usize,
+    pub discard_before_ts: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +78,7 @@ pub struct AppPaths {
     pub config_path: PathBuf,
     pub socket_path: PathBuf,
     pub log_file: PathBuf,
+    pub identities_dir: PathBuf,
     pub gateway_private_key_path: PathBuf,
     pub gateway_public_key_path: PathBuf,
     pub gateway_device_auth_store_path: PathBuf,
@@ -85,6 +96,8 @@ pub struct StoredConfig {
     pub attention: StoredAttentionConfig,
     #[serde(default)]
     pub routing: StoredRoutingConfig,
+    #[serde(default)]
+    pub replay: StoredReplayConfig,
     #[serde(default)]
     pub ipc: StoredIpcConfig,
     #[serde(default)]
@@ -110,6 +123,10 @@ pub struct StoredServerConfig {
     #[serde(default)]
     pub registration_name: Option<String>,
     #[serde(default)]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_pack_paths: Option<Vec<String>>,
+    #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_session_key: Option<String>,
@@ -118,6 +135,12 @@ pub struct StoredServerConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StoredRoutingConfig {
     pub wake_session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StoredReplayConfig {
+    pub dedupe_window_size: Option<usize>,
+    pub discard_before_ts: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -173,6 +196,7 @@ impl Default for StoredConfig {
             servers: vec![],
             attention: StoredAttentionConfig::default(),
             routing: StoredRoutingConfig::default(),
+            replay: StoredReplayConfig::default(),
             ipc: StoredIpcConfig::default(),
             logging: StoredLoggingConfig::default(),
             retry: StoredRetryConfig::default(),
@@ -233,6 +257,11 @@ impl Config {
             servers.push(ServerConfig {
                 websocket_url: derive_subspace_ws_url(&base_url)?,
                 enabled: server.enabled.unwrap_or(true),
+                registration_name: server
+                    .registration_name
+                    .unwrap_or_else(default_registration_name),
+                identity: server.identity,
+                local_pack_paths: server.local_pack_paths,
                 session_path: server_dir.join("subspace-session.json"),
                 runtime_path: server_dir.join("runtime.json"),
                 server_key,
@@ -277,6 +306,14 @@ impl Config {
                     .wake_session_key
                     .unwrap_or_else(|| "agent:heimdal:main".to_string()),
             },
+            replay: ReplayConfig {
+                dedupe_window_size: stored.replay.dedupe_window_size.unwrap_or(500),
+                discard_before_ts: stored
+                    .replay
+                    .discard_before_ts
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            },
             logging: LoggingConfig {
                 level: stored.logging.level.unwrap_or_else(|| "info".to_string()),
                 json: stored.logging.json.unwrap_or(true),
@@ -314,7 +351,7 @@ impl StoredConfig {
         write_json_atomic(path, self)
     }
 
-    pub fn upsert_server(&mut self, base_url: String, registration_name: String) {
+    pub fn upsert_server(&mut self, base_url: String, registration_name: String, identity: String) {
         if let Some(existing) = self.servers.iter_mut().find(|server| {
             canonicalize_base_url(&server.base_url)
                 .map(|value| value == base_url)
@@ -322,15 +359,26 @@ impl StoredConfig {
         }) {
             existing.base_url = base_url;
             existing.registration_name = Some(registration_name);
+            existing.identity = Some(identity);
             existing.enabled = Some(true);
             return;
         }
         self.servers.push(StoredServerConfig {
             base_url,
             registration_name: Some(registration_name),
+            identity: Some(identity),
+            local_pack_paths: None,
             enabled: Some(true),
             wake_session_key: None,
         });
+    }
+}
+
+impl ServerConfig {
+    pub fn effective_local_pack_paths(&self, global_paths: &[String]) -> Vec<String> {
+        self.local_pack_paths
+            .clone()
+            .unwrap_or_else(|| global_paths.to_vec())
     }
 }
 
@@ -459,6 +507,7 @@ pub fn derive_app_paths(config_path: PathBuf, socket_override: Option<&str>) -> 
         config_path,
         socket_path,
         log_file: root.join("logs").join("daemon.log"),
+        identities_dir: root.join("identities"),
         gateway_private_key_path: root.join("device").join("private.pem"),
         gateway_public_key_path: root.join("device").join("public.pem"),
         gateway_device_auth_store_path: root.join("device-auth.json"),
@@ -623,7 +672,7 @@ mod tests {
             &config_path,
             r#"{
               "servers": [
-                { "base_url": "http://example.com", "registration_name": "heimdal" }
+                { "base_url": "http://example.com", "registration_name": "heimdal", "identity": "heimdal" }
               ]
             }"#,
         )
@@ -634,6 +683,8 @@ mod tests {
             config.servers[0].websocket_url,
             "ws://example.com/api/firehose/stream/websocket"
         );
+        assert_eq!(config.servers[0].registration_name, "heimdal");
+        assert_eq!(config.servers[0].identity.as_deref(), Some("heimdal"));
         assert!(config.servers[0].runtime_path.ends_with("runtime.json"));
         assert_eq!(config.paths.config_path, config_path);
     }
@@ -646,8 +697,8 @@ mod tests {
             &config_path,
             r#"{
               "servers": [
-                { "base_url": "http://146.190.132.104", "registration_name": "heimdal" },
-                { "base_url": "https://example.com/subspace", "registration_name": "backup" }
+                { "base_url": "http://146.190.132.104", "registration_name": "heimdal", "identity": "heimdal" },
+                { "base_url": "https://example.com/subspace", "registration_name": "backup", "identity": "backup" }
               ]
             }"#,
         )
@@ -680,8 +731,8 @@ mod tests {
             &config_path,
             r#"{
               "servers": [
-                { "base_url": "http://146.190.132.104", "registration_name": "a" },
-                { "base_url": "http://64.23.172.52", "registration_name": "b", "wake_session_key": "agent:custom:target" }
+                { "base_url": "http://146.190.132.104", "registration_name": "a", "identity": "a" },
+                { "base_url": "http://64.23.172.52", "registration_name": "b", "identity": "b", "wake_session_key": "agent:custom:target" }
               ],
               "routing": { "wake_session_key": "agent:global:main" }
             }"#,
@@ -705,7 +756,7 @@ mod tests {
             &config_path,
             r#"{
               "servers": [
-                { "base_url": "http://example.com", "registration_name": "test" }
+                { "base_url": "http://example.com", "registration_name": "test", "identity": "test" }
               ]
             }"#,
         )
@@ -714,5 +765,73 @@ mod tests {
         let config = Config::load(config_path).unwrap();
         assert_eq!(config.servers[0].wake_session_key, None);
         assert_eq!(config.routing.wake_session_key, "agent:heimdal:main");
+    }
+
+    #[test]
+    fn per_server_local_pack_paths_override_global_defaults() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "servers": [
+                {
+                  "base_url": "http://146.190.132.104",
+                  "registration_name": "a",
+                  "identity": "a",
+                  "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs/server-a"]
+                },
+                {
+                  "base_url": "http://64.23.172.52",
+                  "registration_name": "b",
+                  "identity": "b"
+                }
+              ],
+              "attention": {
+                "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs/global"]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(
+            config.servers[0].effective_local_pack_paths(&config.attention.local_pack_paths),
+            vec!["~/.openclaw/subspace-daemon/receptors/packs/server-a".to_string()]
+        );
+        assert_eq!(
+            config.servers[1].effective_local_pack_paths(&config.attention.local_pack_paths),
+            vec!["~/.openclaw/subspace-daemon/receptors/packs/global".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_per_server_local_pack_paths_allow_passthrough() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "servers": [
+                {
+                  "base_url": "http://146.190.132.104",
+                  "registration_name": "a",
+                  "identity": "a",
+                  "local_pack_paths": []
+                }
+              ],
+              "attention": {
+                "local_pack_paths": ["~/.openclaw/subspace-daemon/receptors/packs/global"]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert!(
+            config.servers[0]
+                .effective_local_pack_paths(&config.attention.local_pack_paths)
+                .is_empty()
+        );
     }
 }

@@ -77,8 +77,12 @@ pub fn load_receptor_packs(pack_paths: &[String]) -> Result<Vec<ReceptorDefiniti
             let receptors = load_pack_file(&expanded)?;
             all_receptors.extend(receptors);
         } else if expanded.is_dir() {
-            let entries = std::fs::read_dir(&expanded)
-                .with_context(|| format!("failed to read receptor pack directory: {}", expanded.display()))?;
+            let entries = std::fs::read_dir(&expanded).with_context(|| {
+                format!(
+                    "failed to read receptor pack directory: {}",
+                    expanded.display()
+                )
+            })?;
 
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -120,7 +124,9 @@ mod tests {
     fn parses_receptor_pack() {
         let dir = tempdir().unwrap();
         let pack_path = dir.path().join("test-pack.json");
-        std::fs::write(&pack_path, r#"{
+        std::fs::write(
+            &pack_path,
+            r#"{
             "pack_id": "test",
             "version": "1.0.0",
             "receptors": [
@@ -137,7 +143,9 @@ mod tests {
                     "description": "Accept all"
                 }
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let receptors = load_receptor_packs(&[pack_path.to_string_lossy().to_string()]).unwrap();
         assert_eq!(receptors.len(), 2);
@@ -150,15 +158,24 @@ mod tests {
     fn rejects_duplicate_receptor_ids() {
         let dir = tempdir().unwrap();
         let pack_path = dir.path().join("dupe.json");
-        std::fs::write(&pack_path, r#"{
+        std::fs::write(
+            &pack_path,
+            r#"{
             "receptors": [
                 { "receptor_id": "same", "class": "broad" },
                 { "receptor_id": "same", "class": "project" }
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let result = load_receptor_packs(&[pack_path.to_string_lossy().to_string()]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("duplicate receptor_id"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate receptor_id")
+        );
     }
 }
