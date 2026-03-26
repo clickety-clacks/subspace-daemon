@@ -302,10 +302,15 @@ impl AttentionLayer {
     /// Evaluate a message against all receptors and decide whether to deliver.
     ///
     /// Returns an AttentionResult with delivery decision and match details.
-    pub async fn evaluate(
+    pub async fn evaluate(&self, message_text: &str, sender_embeddings: &[MessageEmbedding]) -> AttentionResult {
+        self.evaluate_with_embeddings(message_text, Some(sender_embeddings))
+            .await
+    }
+
+    pub async fn evaluate_with_embeddings(
         &self,
-        _message_text: &str,
-        sender_embeddings: &[MessageEmbedding],
+        message_text: &str,
+        supplied_embeddings: Option<&[MessageEmbedding]>,
     ) -> AttentionResult {
         // Fallback: deliver all if no receptors configured
         if self.receptors.is_empty() {
@@ -345,8 +350,9 @@ impl AttentionLayer {
         }
 
         // Embed the message
-        let Some((message_vector, vector_space_id)) =
-            self.select_sender_message_vector(sender_embeddings)
+        let Some((message_vector, vector_space_id)) = self
+            .select_message_vector(message_text, supplied_embeddings)
+            .await
         else {
             return AttentionResult {
                 deliver: false,
@@ -400,22 +406,44 @@ impl AttentionLayer {
         }
     }
 
-    fn select_sender_message_vector(
+    async fn select_message_vector(
         &self,
-        sender_embeddings: &[MessageEmbedding],
+        message_text: &str,
+        supplied_embeddings: Option<&[MessageEmbedding]>,
     ) -> Option<(Vec<f32>, String)> {
         if let Some(space_id) = self.space_id.as_deref() {
-            if let Some(sender_embedding) = sender_embeddings
-                .iter()
-                .find(|embedding| embedding.space_id == space_id)
-            {
-                return Some((
-                    sender_embedding.vector.clone(),
-                    sender_embedding.space_id.clone(),
-                ));
+            if let Some(supplied_embeddings) = supplied_embeddings {
+                if let Some(sender_embedding) = supplied_embeddings
+                    .iter()
+                    .find(|embedding| embedding.space_id == space_id)
+                {
+                    return Some((
+                        sender_embedding.vector.clone(),
+                        sender_embedding.space_id.clone(),
+                    ));
+                }
             }
         }
-        None
+
+        let Some(plugin) = &self.plugin else {
+            return None;
+        };
+
+        match plugin.embed(&[message_text]).await {
+            Ok(mut vectors) if !vectors.is_empty() => {
+                Some((vectors.remove(0), plugin.space_id().to_string()))
+            }
+            Ok(_) => None,
+            Err(err) => {
+                warn!(
+                    component = "attention",
+                    event = "message_embedding_failed",
+                    error = %err,
+                    "failed to compute inbound message embedding"
+                );
+                None
+            }
+        }
     }
 
     /// Get the number of configured receptors.
@@ -595,6 +623,7 @@ pub fn format_attention_annotation(result: &AttentionResult) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
 
@@ -640,7 +669,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_self_embed_when_sender_embedding_is_missing() {
+    async fn falls_back_to_local_embedding_when_sender_embedding_is_missing() {
+        let dir = tempdir().unwrap();
+        let plugin_path = dir.path().join("embed.sh");
+        fs::write(
+            &plugin_path,
+            "#!/bin/sh\ncat <<'JSON'\n{\"space_id\":\"test:model:2:v1\",\"vectors\":[{\"input_id\":\"input_0\",\"vector\":[1.0,0.0]}]}\nJSON\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let layer = AttentionLayer {
             config: AttentionConfig {
                 threshold: 0.5,
@@ -652,16 +693,75 @@ mod tests {
                 vector: Some(vec![1.0, 0.0]),
                 space_id: Some("test:model:2:v1".to_string()),
             }],
-            plugin: None,
+            plugin: Some(EmbeddingPluginClient::new(EmbeddingBackendConfig {
+                backend_id: "test".to_string(),
+                exec_path: plugin_path.display().to_string(),
+                args: Vec::new(),
+                default_space_id: "test:model:2:v1".to_string(),
+                enabled: true,
+                env: HashMap::new(),
+            })),
             space_id: Some("test:model:2:v1".to_string()),
             degraded: false,
         };
 
         let result = layer.evaluate("no attached embedding", &[]).await;
 
-        assert!(!result.deliver);
+        assert!(result.deliver);
         assert!(!result.fallback);
-        assert_eq!(result.space_id, None);
+        assert_eq!(result.space_id.as_deref(), Some("test:model:2:v1"));
+    }
+
+    #[tokio::test]
+    async fn supplied_embedding_wins_over_local_compute() {
+        let dir = tempdir().unwrap();
+        let plugin_path = dir.path().join("embed.sh");
+        fs::write(
+            &plugin_path,
+            "#!/bin/sh\ncat <<'JSON'\n{\"space_id\":\"test:model:2:v1\",\"vectors\":[{\"input_id\":\"input_0\",\"vector\":[0.0,1.0]}]}\nJSON\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let layer = AttentionLayer {
+            config: AttentionConfig {
+                threshold: 0.5,
+                ..AttentionConfig::default()
+            },
+            receptors: vec![ComputedReceptor {
+                receptor_id: "match".to_string(),
+                class: ReceptorClass::Broad,
+                vector: Some(vec![1.0, 0.0]),
+                space_id: Some("test:model:2:v1".to_string()),
+            }],
+            plugin: Some(EmbeddingPluginClient::new(EmbeddingBackendConfig {
+                backend_id: "test".to_string(),
+                exec_path: plugin_path.display().to_string(),
+                args: Vec::new(),
+                default_space_id: "test:model:2:v1".to_string(),
+                enabled: true,
+                env: HashMap::new(),
+            })),
+            space_id: Some("test:model:2:v1".to_string()),
+            degraded: false,
+        };
+
+        let result = layer
+            .evaluate_with_embeddings(
+                "plugin would miss",
+                Some(&[MessageEmbedding {
+                    space_id: "test:model:2:v1".to_string(),
+                    vector: vec![1.0, 0.0],
+                }]),
+            )
+            .await;
+
+        assert!(result.deliver);
+        assert_eq!(result.space_id.as_deref(), Some("test:model:2:v1"));
     }
 
     #[tokio::test]

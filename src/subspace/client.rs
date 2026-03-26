@@ -563,7 +563,8 @@ fn ws_text(message: Message) -> Result<WsFrame> {
 
 fn parse_message_embeddings(payload: &Value) -> Vec<MessageEmbedding> {
     payload
-        .get("embeddings")
+        .get("supplied_embeddings")
+        .or_else(|| payload.get("embeddings"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -586,4 +587,27 @@ fn parse_message_embeddings(payload: &Value) -> Vec<MessageEmbedding> {
             Some(MessageEmbedding { space_id, vector })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_supplied_embeddings_payload_key() {
+        let payload = json!({
+            "supplied_embeddings": [
+                {"space_id": "test:space", "vector": [1.0, 0.0]}
+            ],
+            "embeddings": [
+                {"space_id": "wrong:space", "vector": [0.0, 1.0]}
+            ]
+        });
+
+        let parsed = parse_message_embeddings(&payload);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].space_id, "test:space");
+        assert_eq!(parsed[0].vector, vec![1.0, 0.0]);
+    }
 }

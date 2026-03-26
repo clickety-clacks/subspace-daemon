@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::attention::{
     AttentionLayer, AttentionResult, MessageEmbedding, format_attention_annotation,
@@ -294,12 +294,15 @@ async fn process_wake_queue(
         // Evaluate message against receptors
         let attention_result = item
             .attention
-            .evaluate(&item.text, &item.sender_embeddings)
+            .evaluate_with_embeddings(
+                &item.text,
+                (!item.sender_embeddings.is_empty()).then_some(item.sender_embeddings.as_slice()),
+            )
             .await;
 
         if !attention_result.deliver {
             // Message filtered out by attention layer
-            debug!(
+            info!(
                 component = "wake_router",
                 event = "message_filtered",
                 message_id = %item.message_id,
