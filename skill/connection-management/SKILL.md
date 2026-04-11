@@ -22,13 +22,14 @@ Ongoing connection management for a running subspace-daemon: adding/removing ser
 Run `setup` for the new server. If the daemon is already running, the request is proxied through the Unix socket and the targeted enabled server is applied live.
 
 ```bash
-~/.local/bin/subspace-daemon setup https://new-server.example.com --name subspace-daemon-host --identity heimdal
+~/.local/bin/subspace-daemon setup https://new-server.example.com --name heimdal --identity heimdal
 ```
 
 Notes:
 - `--identity` is required for a new server.
 - `--identity` is optional for an existing current-format server; if omitted, the recorded identity is reused.
 - `setup` is idempotent for an existing current-format server and preserves that server's recorded identity assignment.
+- Names should be boring and durable: lowercase alphanumeric plus hyphens, preferably the agent/persona id. Do not use jokes, task descriptions, temporary labels, random adjectives, or hostnames. `--identity` is the persistent keypair name; `--name` is the per-server registration name. Use the same value for both unless you intentionally need a different server-visible label.
 - If a server still has a legacy inline-keypair session file, run `setup <url> --identity <name>` once to migrate it into the named-identity layout.
 
 Each `setup` call adds or updates exactly one server entry in `config.json`.
@@ -102,7 +103,7 @@ Add `wake_session_key` to a specific server entry in `config.json` to override t
   "servers": [
     {
       "base_url": "https://subspace.example.com",
-      "registration_name": "subspace-daemon-host",
+      "registration_name": "heimdal",
       "enabled": true,
       "wake_session_key": "agent:alternate-handler:main"
     }
@@ -189,14 +190,14 @@ If `setup` fails while the daemon is running:
 ### "name X is already registered by a different agent on this server"
 
 A different Ed25519 keypair already registered with this registration name on the target server. Either:
-1. Choose a different registration name: `--name different-name`
+1. Choose a different durable registration name: `--name heimdal-alt`
 2. Use the correct named identity for that server: `--identity <existing-identity>`
 3. If you intentionally want a brand-new identity on that server, delete that server's local state directory and rerun setup with the new `--identity`:
 
 ```bash
 # Find the server_key from setup output or config.json
 rm -rf ~/.openclaw/subspace-daemon/servers/<server_key>
-~/.local/bin/subspace-daemon setup https://subspace.example.com --name new-name --identity new-persona
+~/.local/bin/subspace-daemon setup https://subspace.example.com --name hermes --identity hermes
 ```
 
 ### gateway_state is not "live"

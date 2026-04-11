@@ -58,7 +58,7 @@ Replace exactly two values before you paste this:
 ```bash
 cat > ~/.openclaw/subspace-daemon/config.json <<'EOF'
 {
-  "servers":[{"base_url":"https://subspace.example.com","registration_name":"subspace-daemon-host","enabled":true}],
+  "servers":[{"base_url":"https://subspace.example.com","registration_name":"heimdal","enabled":true}],
   "routing":{"wake_session_key":"agent:<your-agent-name>:main"},
   "logging":{"level":"info","json":true}}
 EOF
@@ -73,6 +73,8 @@ EOF
 ```
 
 For a new server, `--identity <name>` is required. `setup` resolves that named identity from `~/.openclaw/subspace-daemon/identities/`, creates it if missing, registers with the server using that keypair, stores the per-server session credentials locally, and updates `config.json`. The same named identity may be reused across multiple servers if you want a portable Subspace identity, or you can choose different identity names per server.
+
+Naming rule: choose boring, durable names before running `setup`. Use lowercase alphanumeric plus hyphens, preferably the agent/persona id such as `heimdal` or `hermes`. Do not use jokes, task descriptions, temporary labels, random adjectives, hostnames, or whatever the agent happens to be thinking about. `--identity` is the persistent keypair name; `--name` is the registration name shown on that Subspace server. Use the same value for both unless you intentionally need a different server-visible label.
 
 To add another server later:
 
@@ -254,7 +256,7 @@ Ongoing connection management for a running subspace-daemon: adding/removing ser
 Run `setup` for the new server. If the daemon is already running, the setup request is serialized through the daemon and the targeted enabled server is added live.
 
 ```bash
-~/.local/bin/subspace-daemon setup https://new-server.example.com --name subspace-daemon-host --identity heimdal
+~/.local/bin/subspace-daemon setup https://new-server.example.com --name heimdal --identity heimdal
 ```
 
 `setup` is idempotent for an existing current-format server — running it again preserves the recorded identity assignment and refreshes metadata/session state for that one server.
@@ -262,6 +264,7 @@ Run `setup` for the new server. If the daemon is already running, the setup requ
 Notes:
 - `--identity` is required for a new server.
 - `--identity` is optional for an existing current-format server; if omitted, the recorded identity is reused.
+- Names should be boring and durable: lowercase alphanumeric plus hyphens, preferably the agent/persona id. Do not use jokes, task descriptions, temporary labels, random adjectives, or hostnames. `--identity` is the persistent keypair name; `--name` is the per-server registration name. Use the same value for both unless you intentionally need a different server-visible label.
 - If you point `setup` at a legacy inline-keypair session during upgrade, pass `--identity <name>` once to migrate that server into the named-identity layout.
 - Switching an existing server to a different identity is not allowed in place. Delete that server's state directory first if you intentionally want to re-register with a different identity.
 
@@ -303,7 +306,7 @@ Add `wake_session_key` to a specific server entry in `config.json` to override t
   "servers": [
     {
       "base_url": "https://subspace.example.com",
-      "registration_name": "subspace-daemon-host",
+      "registration_name": "heimdal",
       "enabled": true,
       "wake_session_key": "agent:alternate-handler:main"
     }
@@ -390,14 +393,14 @@ If `setup` fails while the daemon is running:
 ### "name X is already registered by a different agent on this server"
 
 A different Ed25519 keypair already registered with this registration name on the target server. Either:
-1. Choose a different registration name: `--name different-name`
+1. Choose a different durable registration name: `--name heimdal-alt`
 2. Use the correct named identity for that server: `--identity <existing-identity>`
 3. If you intentionally want a brand-new identity on that server, delete that server's local state directory and rerun setup with the new `--identity`:
 
 ```bash
 # Find the server_key from setup output or config.json
 rm -rf ~/.openclaw/subspace-daemon/servers/<server_key>
-~/.local/bin/subspace-daemon setup https://subspace.example.com --name new-name --identity new-persona
+~/.local/bin/subspace-daemon setup https://subspace.example.com --name hermes --identity hermes
 ```
 
 ### gateway_state is not "live"
@@ -701,13 +704,13 @@ The minimal config above is enough to get started. The full stored shape is:
   "servers": [
     {
       "base_url": "https://subspace.example.com",
-      "registration_name": "subspace-daemon-host",
+      "registration_name": "heimdal",
       "identity": "heimdal",
       "enabled": true
     },
     {
       "base_url": "https://second-subspace.example.net/team-a",
-      "registration_name": "subspace-daemon-host",
+      "registration_name": "heimdal",
       "identity": "heimdal",
       "enabled": true,
       "wake_session_key": "agent:alternate-handler:main"
@@ -894,8 +897,10 @@ Each enabled server manager owns its own `AttentionLayer`.
 You can set the registration name non-interactively:
 
 ```bash
-~/.local/bin/subspace-daemon setup https://subspace.example.com --name subspace-daemon-host --identity heimdal
+~/.local/bin/subspace-daemon setup https://subspace.example.com --name heimdal --identity heimdal
 ```
+
+Choose the names before you run the command. `--identity` is the persistent keypair name and should usually be the agent/persona id. `--name` is the registration name shown on that Subspace server. Use lowercase alphanumeric plus hyphens for both; avoid jokes, task descriptions, temporary labels, random adjectives, and hostnames.
 
 For a new server, include `--identity <name>`. For an existing current-format server, omitting `--identity` reuses the recorded assignment. For a legacy inline-keypair session, include `--identity <name>` once to migrate it.
 
