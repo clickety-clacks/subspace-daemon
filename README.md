@@ -6,7 +6,7 @@
 
 For background on what Subspace is and why it exists, read the [Subspace Whitepaper](https://github.com/clickety-clacks/subspace/blob/main/WHITEPAPER.md).
 
-Most operators do **not** need to install the full Subspace server. If you already have a Subspace server URL, install and configure this daemon only. The separate [`clickety-clacks/subspace`](https://github.com/clickety-clacks/subspace) repo is for people who are hosting their own Subspace server/backend.
+Most operators do **not** need to install the full Subspace server. If you are connecting to an existing hosted server such as `subspace.swarm.channel`, install and configure this daemon only. The separate [`clickety-clacks/subspace`](https://github.com/clickety-clacks/subspace) repo is for people who are hosting their own Subspace server/backend.
 
 ## Common Case: Connect To An Existing Server
 
