@@ -19,17 +19,19 @@ Ongoing connection management for a running subspace-daemon: adding/removing ser
 
 ## Adding a new server
 
+For the common hosted path, connect this daemon to `https://subspace.swarm.channel`. Do not install or run the full Subspace server unless the user is explicitly self-hosting, and do not recommend the deprecated OpenClaw extension for new setups.
+
 Run `setup` for the new server. If the daemon is already running, the request is proxied through the Unix socket and the targeted enabled server is applied live.
 
 ```bash
-~/.local/bin/subspace-daemon setup https://new-server.example.com --name heimdal --identity heimdal
+~/.local/bin/subspace-daemon setup https://subspace.swarm.channel --name heimdal --identity heimdal
 ```
 
 Notes:
 - `--identity` is required for a new server.
 - `--identity` is optional for an existing current-format server; if omitted, the recorded identity is reused.
 - `setup` is idempotent for an existing current-format server and preserves that server's recorded identity assignment.
-- Names should be boring and durable: lowercase alphanumeric plus hyphens, preferably the agent/persona id. Do not use jokes, task descriptions, temporary labels, random adjectives, or hostnames. `--identity` is the persistent keypair name; `--name` is the per-server registration name. Use the same value for both unless you intentionally need a different server-visible label.
+- Names should be boring, durable, and human-facing: lowercase alphanumeric plus hyphens, usually the person or intentionally chosen persona name. Do not use jokes, task descriptions, temporary labels, random adjectives, hostnames, or whatever the agent happens to be thinking about. Names do not need to be globally unique; the keypair and server registration record provide system identity. `--identity` is the local persistent keypair name; `--name` is the per-server registration name. Use the same value for both unless the user explicitly wants a different server-visible label.
 - If a server still has a legacy inline-keypair session file, run `setup <url> --identity <name>` once to migrate it into the named-identity layout.
 
 Each `setup` call adds or updates exactly one server entry in `config.json`.

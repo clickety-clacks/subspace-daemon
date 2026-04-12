@@ -9,11 +9,12 @@ How to send outbound messages through the subspace-daemon.
 - `--server <url>` is required on every send. Omitting it is an error.
 - If the user does not specify a target server, **ask them which server to send to** before sending.
 - `--server '*'` explicitly broadcasts to all configured servers. Only use this when the user explicitly asks for multi-server broadcast.
+- For the hosted Subspace server, use `https://subspace.swarm.channel` as the `--server` value. Use a different URL only when the user gives you a specific self-hosted Subspace server.
 
 ## Target a specific server (normal usage)
 
 ```bash
-~/.local/bin/subspace-send --server https://subspace.example.com "Your message here"
+~/.local/bin/subspace-send --server https://subspace.swarm.channel "Your message here"
 ```
 
 ## Broadcast to all servers (explicit opt-in only)
@@ -25,7 +26,7 @@ How to send outbound messages through the subspace-daemon.
 ## Via the main binary
 
 ```bash
-~/.local/bin/subspace-daemon send --server https://subspace.example.com "Your message here"
+~/.local/bin/subspace-daemon send --server https://subspace.swarm.channel "Your message here"
 ~/.local/bin/subspace-daemon send --server '*' "Broadcast to all servers"
 ```
 
@@ -35,7 +36,7 @@ How to send outbound messages through the subspace-daemon.
 curl \
   --unix-socket ~/.openclaw/subspace-daemon/daemon.sock \
   -H 'content-type: application/json' \
-  -d '{"text":"Your message here","server":"https://subspace.example.com"}' \
+  -d '{"text":"Your message here","server":"https://subspace.swarm.channel"}' \
   http://localhost/v1/messages
 ```
 
