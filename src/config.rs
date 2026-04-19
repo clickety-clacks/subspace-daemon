@@ -70,6 +70,26 @@ pub struct RetryConfig {
     pub base_ms: u64,
     pub max_ms: u64,
     pub jitter_ratio: f64,
+    pub storm_guard: StormGuardConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct StormGuardConfig {
+    pub failure_window_ms: u64,
+    pub consecutive_failure_threshold: u32,
+    pub cooldown_ms: u64,
+    pub max_cooldown_ms: u64,
+}
+
+impl Default for StormGuardConfig {
+    fn default() -> Self {
+        Self {
+            failure_window_ms: 300_000,
+            consecutive_failure_threshold: 10,
+            cooldown_ms: 300_000,
+            max_cooldown_ms: 3_600_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +180,16 @@ pub struct StoredRetryConfig {
     pub base_ms: Option<u64>,
     pub max_ms: Option<u64>,
     pub jitter_ratio: Option<f64>,
+    #[serde(default)]
+    pub storm_guard: StoredStormGuardConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StoredStormGuardConfig {
+    pub failure_window_ms: Option<u64>,
+    pub consecutive_failure_threshold: Option<u32>,
+    pub cooldown_ms: Option<u64>,
+    pub max_cooldown_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -322,6 +352,24 @@ impl Config {
                 base_ms: stored.retry.base_ms.unwrap_or(1_000),
                 max_ms: stored.retry.max_ms.unwrap_or(60_000),
                 jitter_ratio: stored.retry.jitter_ratio.unwrap_or(0.2),
+                storm_guard: StormGuardConfig {
+                    failure_window_ms: stored
+                        .retry
+                        .storm_guard
+                        .failure_window_ms
+                        .unwrap_or(300_000),
+                    consecutive_failure_threshold: stored
+                        .retry
+                        .storm_guard
+                        .consecutive_failure_threshold
+                        .unwrap_or(10),
+                    cooldown_ms: stored.retry.storm_guard.cooldown_ms.unwrap_or(300_000),
+                    max_cooldown_ms: stored
+                        .retry
+                        .storm_guard
+                        .max_cooldown_ms
+                        .unwrap_or(3_600_000),
+                },
             },
             paths,
         })
@@ -833,5 +881,35 @@ mod tests {
                 .effective_local_pack_paths(&config.attention.local_pack_paths)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn loads_retry_storm_guard_config() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "retry": {
+                "base_ms": 50,
+                "max_ms": 1000,
+                "jitter_ratio": 0.0,
+                "storm_guard": {
+                  "failure_window_ms": 60000,
+                  "consecutive_failure_threshold": 3,
+                  "cooldown_ms": 5000,
+                  "max_cooldown_ms": 30000
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.retry.base_ms, 50);
+        assert_eq!(config.retry.storm_guard.failure_window_ms, 60_000);
+        assert_eq!(config.retry.storm_guard.consecutive_failure_threshold, 3);
+        assert_eq!(config.retry.storm_guard.cooldown_ms, 5_000);
+        assert_eq!(config.retry.storm_guard.max_cooldown_ms, 30_000);
     }
 }

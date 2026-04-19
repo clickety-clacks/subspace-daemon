@@ -24,6 +24,14 @@ pub struct ServerHealth {
     pub server: String,
     pub server_key: String,
     pub subspace_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consecutive_failures: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +54,10 @@ impl DaemonStatus {
                         server: server.base_url.clone(),
                         server_key: server.server_key.clone(),
                         subspace_state: "connecting".to_string(),
+                        consecutive_failures: None,
+                        cooldown_ms: None,
+                        next_attempt_at: None,
+                        last_error_kind: None,
                     },
                 )
             })
@@ -62,7 +74,7 @@ impl DaemonStatus {
             && self.servers.values().all(|server| {
                 matches!(
                     server.subspace_state.as_str(),
-                    "live" | "reconnecting" | "subspace_auth_required"
+                    "live" | "reconnecting" | "reconnect_cooldown" | "subspace_auth_required"
                 )
             })
     }
@@ -78,6 +90,33 @@ impl DaemonStatus {
                 server: base_url.to_string(),
                 server_key: server_key.to_string(),
                 subspace_state: value.into(),
+                consecutive_failures: None,
+                cooldown_ms: None,
+                next_attempt_at: None,
+                last_error_kind: None,
+            },
+        );
+    }
+
+    pub fn set_server_reconnect_cooldown(
+        &mut self,
+        base_url: &str,
+        server_key: &str,
+        consecutive_failures: u32,
+        cooldown_ms: u64,
+        next_attempt_at: String,
+        last_error_kind: Option<String>,
+    ) {
+        self.servers.insert(
+            base_url.to_string(),
+            ServerHealth {
+                server: base_url.to_string(),
+                server_key: server_key.to_string(),
+                subspace_state: "reconnect_cooldown".to_string(),
+                consecutive_failures: Some(consecutive_failures),
+                cooldown_ms: Some(cooldown_ms),
+                next_attempt_at: Some(next_attempt_at),
+                last_error_kind,
             },
         );
     }
@@ -404,4 +443,31 @@ fn render_inbound_wake(message: &WakeEnvelope, attention: &AttentionResult) -> S
     lines.push(message.text.clone());
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_cooldown_counts_as_healthy_readiness_state() {
+        let status = DaemonStatus {
+            gateway_state: "live".to_string(),
+            wake_session_key: "agent:heimdal:main".to_string(),
+            servers: BTreeMap::from([(
+                "https://subspace.example".to_string(),
+                ServerHealth {
+                    server: "https://subspace.example".to_string(),
+                    server_key: "https_subspace_example_443".to_string(),
+                    subspace_state: "reconnect_cooldown".to_string(),
+                    consecutive_failures: Some(10),
+                    cooldown_ms: Some(300_000),
+                    next_attempt_at: Some("2026-04-17T12:05:00Z".to_string()),
+                    last_error_kind: Some("connection_refused".to_string()),
+                },
+            )]),
+        };
+
+        assert!(status.is_healthy());
+    }
 }

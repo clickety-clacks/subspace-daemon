@@ -366,6 +366,10 @@ mod tests {
                     server: base_url.to_string(),
                     server_key: derive_server_key(base_url).unwrap(),
                     subspace_state: "live".to_string(),
+                    consecutive_failures: None,
+                    cooldown_ms: None,
+                    next_attempt_at: None,
+                    last_error_kind: None,
                 },
             )]),
         }));
@@ -386,6 +390,7 @@ mod tests {
                 base_ms: 1_000,
                 max_ms: 60_000,
                 jitter_ratio: 0.2,
+                storm_guard: crate::config::StormGuardConfig::default(),
             },
             replay: ReplayConfig {
                 dedupe_window_size: 500,

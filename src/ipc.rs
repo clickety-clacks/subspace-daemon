@@ -567,3 +567,54 @@ fn error_response(
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+
+    use crate::subspace::client::test_handle;
+    use crate::supervisor::ServerHealth;
+
+    #[tokio::test]
+    async fn targeted_send_to_reconnect_cooldown_returns_503() {
+        let server = "https://subspace.example";
+        let canonical = canonicalize_base_url(server).unwrap();
+        let status = Arc::new(RwLock::new(DaemonStatus {
+            gateway_state: "live".to_string(),
+            wake_session_key: "agent:heimdal:main".to_string(),
+            servers: BTreeMap::from([(
+                canonical.clone(),
+                ServerHealth {
+                    server: canonical.clone(),
+                    server_key: "https_subspace_example_443".to_string(),
+                    subspace_state: "reconnect_cooldown".to_string(),
+                    consecutive_failures: Some(10),
+                    cooldown_ms: Some(300_000),
+                    next_attempt_at: Some("2026-04-17T12:05:00Z".to_string()),
+                    last_error_kind: Some("connect".to_string()),
+                },
+            )]),
+        }));
+        let handles = Arc::new(RwLock::new(BTreeMap::from([(
+            canonical.clone(),
+            test_handle(),
+        )])));
+        let router = SendRouter::new(status, handles);
+
+        let err = router
+            .send(
+                "hello".to_string(),
+                None,
+                Some(server.to_string()),
+                OutboundEmbeddingRequest::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, "subspace_unavailable");
+        assert!(err.message.contains("targeted Subspace server is not live"));
+    }
+}

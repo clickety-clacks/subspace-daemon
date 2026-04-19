@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -187,6 +188,10 @@ async fn run_server_manager(
     let mut backoff = retry.base_ms;
 
     loop {
+        if wait_for_reconnect_cooldown_if_needed(&status, &server, &runtime, &mut shutdown).await {
+            return Ok(());
+        }
+
         let mut session = match load_session_record(&server.session_path)? {
             Some(LoadedSessionRecord::Current(session)) => {
                 let identity_path = identities_dir.join(format!("{}.json", session.identity));
@@ -226,7 +231,13 @@ async fn run_server_manager(
                 }
                 Err(err) => {
                     update_server_state(&status, &server, "subspace_auth_required").await;
-                    warn!(component = "subspace", event = "daemon_degraded", server = %server.base_url, server_key = %server.server_key, error = %err, "subspace auth failed");
+                    let error_kind = reconnect_error_kind(&err);
+                    warn!(component = "subspace", event = "daemon_degraded", server = %server.base_url, server_key = %server.server_key, error_kind = %error_kind, "subspace auth failed");
+                    if record_reconnect_failure(&status, &server, &runtime, &retry, error_kind)
+                        .await?
+                    {
+                        continue;
+                    }
                     tokio::select! {
                         _ = shutdown.recv() => return Ok(()),
                         _ = tokio::time::sleep(Duration::from_millis(jitter(backoff, retry.jitter_ratio))) => {}
@@ -237,6 +248,7 @@ async fn run_server_manager(
             }
         }
 
+        let mut reached_live = false;
         match connect_once(
             &server,
             &retry,
@@ -248,13 +260,21 @@ async fn run_server_manager(
             &mut cmd_rx,
             &wake_tx,
             &mut shutdown,
+            &mut reached_live,
         )
         .await
         {
             Ok(()) => return Ok(()),
             Err(err) => {
+                if reached_live {
+                    backoff = retry.base_ms;
+                }
                 update_server_state(&status, &server, "reconnecting").await;
-                warn!(component = "subspace", event = "daemon_degraded", server = %server.base_url, server_key = %server.server_key, error = %err, "subspace disconnected");
+                let error_kind = reconnect_error_kind(&err);
+                warn!(component = "subspace", event = "daemon_degraded", server = %server.base_url, server_key = %server.server_key, error_kind = %error_kind, "subspace disconnected");
+                if record_reconnect_failure(&status, &server, &runtime, &retry, error_kind).await? {
+                    continue;
+                }
                 tokio::select! {
                     _ = shutdown.recv() => return Ok(()),
                     _ = tokio::time::sleep(Duration::from_millis(jitter(backoff, retry.jitter_ratio))) => {}
@@ -279,6 +299,7 @@ async fn connect_once(
     cmd_rx: &mut mpsc::Receiver<ServerCommand>,
     wake_tx: &mpsc::Sender<WakeEnvelope>,
     shutdown: &mut broadcast::Receiver<()>,
+    reached_live: &mut bool,
 ) -> Result<()> {
     update_server_state(status, server, "connecting").await;
     let (ws, _) = connect_async(&server.websocket_url)
@@ -349,6 +370,12 @@ async fn connect_once(
     }
 
     update_server_state(status, server, "live").await;
+    *reached_live = true;
+    {
+        let mut runtime = runtime.lock().await;
+        runtime.clear_reconnect_storm();
+        runtime.flush()?;
+    }
     info!(component = "subspace", event = "subspace_live", server = %server.base_url, server_key = %server.server_key, "subspace connection is live");
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -535,6 +562,111 @@ async fn update_server_state(
         .write()
         .await
         .set_server_state(&server.base_url, &server.server_key, value.to_string());
+}
+
+async fn update_server_reconnect_cooldown(
+    status: &Arc<RwLock<DaemonStatus>>,
+    server: &ServerConfig,
+    cooldown: &crate::runtime_store::ReconnectCooldown,
+) {
+    status.write().await.set_server_reconnect_cooldown(
+        &server.base_url,
+        &server.server_key,
+        cooldown.consecutive_failures,
+        cooldown.cooldown_ms,
+        cooldown.next_attempt_at.clone(),
+        cooldown.last_error_kind.clone(),
+    );
+}
+
+async fn wait_for_reconnect_cooldown_if_needed(
+    status: &Arc<RwLock<DaemonStatus>>,
+    server: &ServerConfig,
+    runtime: &Arc<Mutex<RuntimeStore>>,
+    shutdown: &mut broadcast::Receiver<()>,
+) -> bool {
+    let Some(cooldown) = runtime.lock().await.reconnect_cooldown() else {
+        return false;
+    };
+    update_server_reconnect_cooldown(status, server, &cooldown).await;
+
+    let now = OffsetDateTime::now_utc();
+    let next_attempt_at = parse_rfc3339(&cooldown.next_attempt_at).unwrap_or(now);
+    if next_attempt_at > now {
+        let wait_ms = (next_attempt_at - now).whole_milliseconds().max(0) as u64;
+        tokio::select! {
+            _ = shutdown.recv() => return true,
+            _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
+        }
+    }
+
+    info!(
+        component = "subspace",
+        event = "subspace_reconnect_cooldown_attempt",
+        server = %server.base_url,
+        server_key = %server.server_key,
+        consecutive_failures = cooldown.consecutive_failures,
+        cooldown_ms = cooldown.cooldown_ms,
+        next_attempt_at = %cooldown.next_attempt_at,
+        last_error_kind = cooldown.last_error_kind.as_deref().unwrap_or("unknown"),
+        "attempting reconnect after cooldown"
+    );
+    false
+}
+
+async fn record_reconnect_failure(
+    status: &Arc<RwLock<DaemonStatus>>,
+    server: &ServerConfig,
+    runtime: &Arc<Mutex<RuntimeStore>>,
+    retry: &RetryConfig,
+    error_kind: String,
+) -> Result<bool> {
+    let cooldown = {
+        let mut runtime = runtime.lock().await;
+        let cooldown =
+            runtime.record_reconnect_failure(OffsetDateTime::now_utc(), retry, error_kind);
+        runtime.flush()?;
+        cooldown
+    };
+    let Some(cooldown) = cooldown else {
+        return Ok(false);
+    };
+
+    update_server_reconnect_cooldown(status, server, &cooldown).await;
+    info!(
+        component = "subspace",
+        event = "subspace_reconnect_cooldown_entered",
+        server = %server.base_url,
+        server_key = %server.server_key,
+        consecutive_failures = cooldown.consecutive_failures,
+        cooldown_ms = cooldown.cooldown_ms,
+        next_attempt_at = %cooldown.next_attempt_at,
+        last_error_kind = cooldown.last_error_kind.as_deref().unwrap_or("unknown"),
+        "subspace reconnect cooldown entered"
+    );
+    Ok(true)
+}
+
+fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+}
+
+fn reconnect_error_kind(err: &anyhow::Error) -> String {
+    let message = err.to_string().to_ascii_lowercase();
+    if message.contains("connection refused") {
+        "connection_refused"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "timeout"
+    } else if message.contains("join failed") {
+        "join_failed"
+    } else if message.contains("auth") {
+        "auth_failed"
+    } else if message.contains("websocket connect") {
+        "websocket_connect_failed"
+    } else {
+        "transport_failed"
+    }
+    .to_string()
 }
 
 enum WsFrame {
