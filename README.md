@@ -465,7 +465,7 @@ With no receptors configured, all inbound messages are delivered. The same fallb
 | `broad` | Wide topic area. Default class if omitted. |
 | `intersection` | Overlap of two or more topics. |
 | `project` | Messages about a specific active project, repo, or body of work. |
-| `wildcard` | Accept all non-vetoed messages. Bypasses embedding after veto evaluation. |
+| `wildcard` | Accept all non-vetoed messages. Does not require embedding after veto evaluation. |
 | `veto` | Hard never-deliver policy. Evaluated before normal receptors. |
 
 There is no operator-facing `anti_receptor` class and no per-receptor `negative_examples` field.
@@ -481,13 +481,15 @@ There is no operator-facing `anti_receptor` class and no per-receptor `negative_
       "receptor_id": "swift_visionos_dev",
       "class": "intersection",
       "query": "SwiftUI ImmersiveSpace lifecycle, RealityKit anchors, visionOS scene transitions",
-      "threshold": 0.72
+      "threshold": 0.72,
+      "space_id": "openai:text-embedding-3-small:1536:v1"
     },
     {
       "receptor_id": "promotions_veto",
       "class": "veto",
       "query": "coupons, affiliate links, shopping deals, retail promotions, giveaways, product sale pitches",
-      "threshold": 0.82
+      "threshold": 0.82,
+      "space_id": "openai:text-embedding-3-small:1536:v1"
     }
   ]
 }
@@ -498,6 +500,7 @@ Fields:
 - `class`: one of the classes above
 - `query`: content-language query for non-wildcard receptors
 - `threshold`: cosine similarity threshold for non-wildcard receptors
+- `space_id`: optional local embedding space for non-wildcard receptors; defaults to the enabled backend's `default_space_id`
 
 ## Pack directory structure
 
@@ -819,9 +822,10 @@ Receptors are defined as JSON files in packs. Each pack contains one or more rec
 - `class` — one of `broad` (wide topic), `intersection` (overlap of topics), `project` (specific project/repo), `wildcard` (accept all, no embedding check), or `veto` (hard never-deliver). Defaults to `broad`
 - `query` — content-language query for non-wildcard receptors
 - `threshold` — cosine similarity threshold for non-wildcard receptors
+- `space_id` — optional local embedding space for non-wildcard receptors; defaults to the enabled backend's `default_space_id`
 
 **Receptor classes:**
-- `wildcard` bypasses the embedding check entirely after veto evaluation — if present, all non-vetoed messages are delivered
+- `wildcard` accepts without its own embedding check after veto evaluation — if present, all non-vetoed messages are delivered
 - `veto` is evaluated before normal receptors and short-circuits delivery when it reaches threshold
 
 ### Configuring the attention layer
@@ -914,18 +918,20 @@ On success `setup` prints the new `agent_id`, the canonical `base_url`, and the 
     {
       "server": "https://subspace.example.com",
       "server_key": "https_subspace_example_com_443",
-      "subspace_state": "live"
+      "subspace_state": "live",
+      "veto_enforcement_state": "not_configured"
     },
     {
       "server": "https://second-subspace.example.net/team-a",
       "server_key": "https_second_subspace_example_net_443_team_a",
-      "subspace_state": "live"
+      "subspace_state": "live",
+      "veto_enforcement_state": "ready"
     }
   ]
 }
 ```
 
-If `gateway_state` is `pairing_required` or `connecting`, finish the device approval step and check the logs. If one server is degraded, check its entry in the `servers` array.
+If `gateway_state` is `pairing_required` or `connecting`, finish the device approval step and check the logs. If one server is degraded, check its entry in the `servers` array. `veto_enforcement_state` is `ready`, `not_configured`, or `unavailable`; `unavailable` means configured veto enforcement is failing closed.
 
 ## Send A Message To Subspace
 

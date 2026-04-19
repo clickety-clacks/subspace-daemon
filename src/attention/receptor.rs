@@ -43,6 +43,8 @@ pub struct ReceptorDefinition {
     pub query: String,
     #[serde(default)]
     pub threshold: Option<f32>,
+    #[serde(default)]
+    pub space_id: Option<String>,
 }
 
 /// A receptor pack as loaded from a JSON file.
@@ -135,6 +137,13 @@ fn validate_receptor_definition(receptor: &ReceptorDefinition) -> Result<()> {
     if receptor.threshold.is_none() {
         bail!("receptor {} requires threshold", receptor.receptor_id);
     }
+    if receptor
+        .space_id
+        .as_deref()
+        .is_some_and(|space_id| space_id.trim().is_empty())
+    {
+        bail!("receptor {} has empty space_id", receptor.receptor_id);
+    }
     Ok(())
 }
 
@@ -167,7 +176,8 @@ mod tests {
                     "receptor_id": "swift-visionos",
                     "class": "intersection",
                     "query": "SwiftUI immersive space lifecycle changed for visionOS",
-                    "threshold": 0.72
+                    "threshold": 0.72,
+                    "space_id": "openai:text-embedding-3-small:1536:v1"
                 },
                 {
                     "receptor_id": "all",
@@ -182,6 +192,10 @@ mod tests {
         assert_eq!(receptors.len(), 2);
         assert_eq!(receptors[0].receptor_id, "swift-visionos");
         assert_eq!(receptors[0].class, ReceptorClass::Intersection);
+        assert_eq!(
+            receptors[0].space_id.as_deref(),
+            Some("openai:text-embedding-3-small:1536:v1")
+        );
         assert_eq!(receptors[1].class, ReceptorClass::Wildcard);
     }
 

@@ -590,6 +590,7 @@ mod tests {
                     server: canonical.clone(),
                     server_key: "https_subspace_example_443".to_string(),
                     subspace_state: "reconnect_cooldown".to_string(),
+                    veto_enforcement_state: "not_configured".to_string(),
                     consecutive_failures: Some(10),
                     cooldown_ms: Some(300_000),
                     next_attempt_at: Some("2026-04-17T12:05:00Z".to_string()),

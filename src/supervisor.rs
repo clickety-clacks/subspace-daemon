@@ -24,6 +24,7 @@ pub struct ServerHealth {
     pub server: String,
     pub server_key: String,
     pub subspace_state: String,
+    pub veto_enforcement_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consecutive_failures: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,6 +55,7 @@ impl DaemonStatus {
                         server: server.base_url.clone(),
                         server_key: server.server_key.clone(),
                         subspace_state: "connecting".to_string(),
+                        veto_enforcement_state: "not_configured".to_string(),
                         consecutive_failures: None,
                         cooldown_ms: None,
                         next_attempt_at: None,
@@ -84,12 +86,18 @@ impl DaemonStatus {
     }
 
     pub fn set_server_state(&mut self, base_url: &str, server_key: &str, value: impl Into<String>) {
+        let veto_enforcement_state = self
+            .servers
+            .get(base_url)
+            .map(|server| server.veto_enforcement_state.clone())
+            .unwrap_or_else(|| "not_configured".to_string());
         self.servers.insert(
             base_url.to_string(),
             ServerHealth {
                 server: base_url.to_string(),
                 server_key: server_key.to_string(),
                 subspace_state: value.into(),
+                veto_enforcement_state,
                 consecutive_failures: None,
                 cooldown_ms: None,
                 next_attempt_at: None,
@@ -107,16 +115,50 @@ impl DaemonStatus {
         next_attempt_at: String,
         last_error_kind: Option<String>,
     ) {
+        let veto_enforcement_state = self
+            .servers
+            .get(base_url)
+            .map(|server| server.veto_enforcement_state.clone())
+            .unwrap_or_else(|| "not_configured".to_string());
         self.servers.insert(
             base_url.to_string(),
             ServerHealth {
                 server: base_url.to_string(),
                 server_key: server_key.to_string(),
                 subspace_state: "reconnect_cooldown".to_string(),
+                veto_enforcement_state,
                 consecutive_failures: Some(consecutive_failures),
                 cooldown_ms: Some(cooldown_ms),
                 next_attempt_at: Some(next_attempt_at),
                 last_error_kind,
+            },
+        );
+    }
+
+    pub fn set_server_veto_enforcement_state(
+        &mut self,
+        base_url: &str,
+        server_key: &str,
+        state: impl Into<String>,
+    ) {
+        let state = state.into();
+        if let Some(server) = self.servers.get_mut(base_url) {
+            server.server_key = server_key.to_string();
+            server.veto_enforcement_state = state;
+            return;
+        }
+
+        self.servers.insert(
+            base_url.to_string(),
+            ServerHealth {
+                server: base_url.to_string(),
+                server_key: server_key.to_string(),
+                subspace_state: "connecting".to_string(),
+                veto_enforcement_state: state,
+                consecutive_failures: None,
+                cooldown_ms: None,
+                next_attempt_at: None,
+                last_error_kind: None,
             },
         );
     }
@@ -460,6 +502,7 @@ mod tests {
                     server: "https://subspace.example".to_string(),
                     server_key: "https_subspace_example_443".to_string(),
                     subspace_state: "reconnect_cooldown".to_string(),
+                    veto_enforcement_state: "not_configured".to_string(),
                     consecutive_failures: Some(10),
                     cooldown_ms: Some(300_000),
                     next_attempt_at: Some("2026-04-17T12:05:00Z".to_string()),
@@ -469,5 +512,50 @@ mod tests {
         };
 
         assert!(status.is_healthy());
+    }
+
+    #[test]
+    fn server_status_preserves_veto_enforcement_state_across_connection_updates() {
+        let mut status = DaemonStatus {
+            gateway_state: "live".to_string(),
+            wake_session_key: "agent:heimdal:main".to_string(),
+            servers: BTreeMap::new(),
+        };
+
+        status.set_server_veto_enforcement_state(
+            "https://subspace.example",
+            "https_subspace_example_443",
+            "unavailable",
+        );
+        status.set_server_state(
+            "https://subspace.example",
+            "https_subspace_example_443",
+            "live",
+        );
+        assert_eq!(
+            status
+                .servers
+                .get("https://subspace.example")
+                .unwrap()
+                .veto_enforcement_state,
+            "unavailable"
+        );
+
+        status.set_server_reconnect_cooldown(
+            "https://subspace.example",
+            "https_subspace_example_443",
+            10,
+            300_000,
+            "2026-04-17T12:05:00Z".to_string(),
+            Some("connection_refused".to_string()),
+        );
+        assert_eq!(
+            status
+                .servers
+                .get("https://subspace.example")
+                .unwrap()
+                .veto_enforcement_state,
+            "unavailable"
+        );
     }
 }

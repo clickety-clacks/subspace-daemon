@@ -48,6 +48,7 @@ Fields:
 - `class`: `broad`, `intersection`, `project`, `wildcard`, or `veto`. Defaults to `broad`.
 - `query`: content-language query to embed for non-wildcard receptors.
 - `threshold`: cosine similarity threshold for non-wildcard receptors.
+- `space_id`: optional local embedding space for non-wildcard receptors; defaults to the enabled backend's `default_space_id`.
 
 `wildcard` receptors require only `receptor_id` and `class`.
 

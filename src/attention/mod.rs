@@ -190,7 +190,9 @@ impl AttentionLayer {
                         "failed to load receptor packs; attention layer degraded"
                     );
                     layer.degraded = true;
-                    layer.veto_enforcement_unavailable = true;
+                    if paths_contain_veto_receptor(&config.local_pack_paths) {
+                        layer.veto_enforcement_unavailable = true;
+                    }
                 }
             }
         }
@@ -233,6 +235,16 @@ impl AttentionLayer {
                 continue;
             }
 
+            let plugin_space_id = plugin.space_id();
+            let receptor_space_id = def.space_id.as_deref().unwrap_or(plugin_space_id);
+            if receptor_space_id != plugin_space_id {
+                anyhow::bail!(
+                    "no enabled embedding backend for receptor {} space_id {}",
+                    def.receptor_id,
+                    receptor_space_id
+                );
+            }
+
             let query = def.query.trim();
             let mut vectors = plugin.embed(&[query]).await.with_context(|| {
                 format!("failed to embed query for receptor: {}", def.receptor_id)
@@ -246,7 +258,7 @@ impl AttentionLayer {
                 class: def.class,
                 threshold: def.threshold.expect("validated receptor threshold"),
                 vector: Some(vector),
-                space_id: self.space_id.clone(),
+                space_id: Some(receptor_space_id.to_string()),
             });
 
             debug!(
@@ -356,26 +368,28 @@ impl AttentionLayer {
             };
         }
 
-        if let Some(receptor) = self
+        let wildcard = self
             .receptors
             .iter()
-            .find(|receptor| receptor.is_wildcard())
-        {
-            return AttentionResult {
-                deliver: true,
-                matches: vec![ReceptorMatch {
+            .find(|receptor| receptor.is_wildcard());
+
+        let Some((message_vector, vector_space_id)) = selected_vector else {
+            if let Some(receptor) = wildcard {
+                matches.push(ReceptorMatch {
                     receptor_id: receptor.receptor_id.clone(),
                     class: receptor.class,
                     score: 1.0,
                     threshold: receptor.threshold,
                     above_threshold: true,
-                }],
-                space_id: None,
-                fallback: false,
-            };
-        };
-
-        let Some((message_vector, vector_space_id)) = selected_vector else {
+                });
+                matches.sort_by(score_desc);
+                return AttentionResult {
+                    deliver: true,
+                    matches,
+                    space_id: None,
+                    fallback: false,
+                };
+            }
             return AttentionResult {
                 deliver: false,
                 matches,
@@ -413,6 +427,16 @@ impl AttentionLayer {
         }
 
         // Sort matches by score descending
+        if let Some(receptor) = wildcard {
+            matches.push(ReceptorMatch {
+                receptor_id: receptor.receptor_id.clone(),
+                class: receptor.class,
+                score: 1.0,
+                threshold: receptor.threshold,
+                above_threshold: true,
+            });
+            any_above_threshold = true;
+        }
         matches.sort_by(score_desc);
 
         AttentionResult {
@@ -456,6 +480,16 @@ impl AttentionLayer {
 
     pub fn is_veto_enforcement_unavailable(&self) -> bool {
         self.veto_enforcement_unavailable
+    }
+
+    pub fn veto_enforcement_state(&self) -> &'static str {
+        if self.veto_enforcement_unavailable {
+            "unavailable"
+        } else if self.receptors.iter().any(|receptor| receptor.is_veto()) {
+            "ready"
+        } else {
+            "not_configured"
+        }
     }
 }
 
@@ -596,6 +630,46 @@ fn first_enabled_backend(
     embedding_backends: &[EmbeddingBackendConfig],
 ) -> Option<EmbeddingBackendConfig> {
     embedding_backends.iter().find(|b| b.enabled).cloned()
+}
+
+fn paths_contain_veto_receptor(pack_paths: &[String]) -> bool {
+    fn file_contains_veto(path: &std::path::Path) -> bool {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return false;
+        };
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            return value
+                .get("receptors")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|receptors| {
+                    receptors.iter().any(|receptor| {
+                        receptor.get("class").and_then(serde_json::Value::as_str) == Some("veto")
+                    })
+                });
+        }
+
+        content.contains("\"class\"") && content.contains("\"veto\"")
+    }
+
+    pack_paths.iter().any(|path_str| {
+        let expanded = crate::config::expand_tilde(std::path::PathBuf::from(path_str));
+        if expanded.is_file() && expanded.extension().is_some_and(|ext| ext == "json") {
+            return file_contains_veto(&expanded);
+        }
+        if !expanded.is_dir() {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(&expanded) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.is_file()
+                && path.extension().is_some_and(|ext| ext == "json")
+                && file_contains_veto(&path)
+        })
+    })
 }
 
 fn score_desc(a: &ReceptorMatch, b: &ReceptorMatch) -> std::cmp::Ordering {
@@ -826,6 +900,71 @@ mod tests {
 
         assert!(layer.is_degraded());
         assert!(layer.is_veto_enforcement_unavailable());
+        assert_eq!(layer.veto_enforcement_state(), "unavailable");
+        assert!(!result.deliver);
+        assert!(!result.fallback);
+    }
+
+    #[tokio::test]
+    async fn positive_only_pack_load_error_does_not_mark_veto_unavailable() {
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("pack.json");
+        fs::write(
+            &pack_path,
+            r#"{
+              "pack_id": "test-pack",
+              "version": "1.0.0",
+              "receptors": [
+                { "receptor_id": "same", "class": "broad", "query": "one", "threshold": 0.7 },
+                { "receptor_id": "same", "class": "project", "query": "two", "threshold": 0.7 }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let layer = AttentionLayer::new(AttentionConfig {
+            local_pack_paths: vec![pack_path.display().to_string()],
+            embedding_backends: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let result = layer.evaluate("plaintext only", &[]).await;
+
+        assert!(layer.is_degraded());
+        assert!(!layer.is_veto_enforcement_unavailable());
+        assert_eq!(layer.veto_enforcement_state(), "not_configured");
+        assert!(result.deliver);
+        assert!(result.fallback);
+    }
+
+    #[tokio::test]
+    async fn veto_pack_load_error_marks_veto_unavailable() {
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("pack.json");
+        fs::write(
+            &pack_path,
+            r#"{
+              "pack_id": "test-pack",
+              "version": "1.0.0",
+              "receptors": [
+                { "receptor_id": "same", "class": "veto", "query": "spam", "threshold": 0.7 },
+                { "receptor_id": "same", "class": "veto", "query": "promos", "threshold": 0.7 }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let layer = AttentionLayer::new(AttentionConfig {
+            local_pack_paths: vec![pack_path.display().to_string()],
+            embedding_backends: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let result = layer.evaluate("plaintext only", &[]).await;
+
+        assert!(layer.is_degraded());
+        assert!(layer.is_veto_enforcement_unavailable());
+        assert_eq!(layer.veto_enforcement_state(), "unavailable");
         assert!(!result.deliver);
         assert!(!result.fallback);
     }
@@ -863,6 +1002,60 @@ mod tests {
         assert!(layer.is_degraded());
         assert!(result.deliver);
         assert!(result.fallback);
+    }
+
+    #[tokio::test]
+    async fn matching_receptor_space_id_materializes_with_backend() {
+        let dir = tempdir().unwrap();
+        let plugin_path = dir.path().join("embed.sh");
+        fs::write(
+            &plugin_path,
+            "#!/bin/sh\ncat <<'JSON'\n{\"space_id\":\"test:model:2:v1\",\"vectors\":[{\"input_id\":\"input_0\",\"vector\":[1.0,0.0]}]}\nJSON\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pack_path = dir.path().join("pack.json");
+        fs::write(
+            &pack_path,
+            r#"{
+              "pack_id": "test-pack",
+              "version": "1.0.0",
+              "receptors": [
+                {
+                  "receptor_id": "match",
+                  "class": "broad",
+                  "query": "subspace daemon review findings",
+                  "threshold": 0.72,
+                  "space_id": "test:model:2:v1"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let layer = AttentionLayer::new(AttentionConfig {
+            local_pack_paths: vec![pack_path.display().to_string()],
+            embedding_backends: vec![EmbeddingBackendConfig {
+                backend_id: "test".to_string(),
+                exec_path: plugin_path.display().to_string(),
+                args: Vec::new(),
+                default_space_id: "test:model:2:v1".to_string(),
+                enabled: true,
+                env: HashMap::new(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(layer.receptors.len(), 1);
+        assert_eq!(
+            layer.receptors[0].space_id.as_deref(),
+            Some("test:model:2:v1")
+        );
     }
 
     #[tokio::test]
@@ -937,6 +1130,57 @@ mod tests {
         assert!(result.fallback);
         assert_eq!(result.matches.len(), 1);
         assert!(!result.matches[0].above_threshold);
+    }
+
+    #[tokio::test]
+    async fn wildcard_delivery_keeps_semantic_interest_matches() {
+        let layer = AttentionLayer {
+            receptors: vec![
+                ComputedReceptor {
+                    receptor_id: "all".to_string(),
+                    class: ReceptorClass::Wildcard,
+                    threshold: 1.0,
+                    vector: None,
+                    space_id: None,
+                },
+                ComputedReceptor {
+                    receptor_id: "apple-platforms".to_string(),
+                    class: ReceptorClass::Broad,
+                    threshold: 0.5,
+                    vector: Some(vec![1.0, 0.0]),
+                    space_id: Some("test:model:2:v1".to_string()),
+                },
+            ],
+            plugin: None,
+            space_id: Some("test:model:2:v1".to_string()),
+            degraded: false,
+            veto_enforcement_unavailable: false,
+        };
+
+        let result = layer
+            .evaluate(
+                "Apple released SwiftUI beta notes",
+                &[MessageEmbedding {
+                    space_id: "test:model:2:v1".to_string(),
+                    vector: vec![1.0, 0.0],
+                }],
+            )
+            .await;
+
+        assert!(result.deliver);
+        assert!(!result.fallback);
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|m| m.receptor_id == "all" && m.above_threshold)
+        );
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|m| m.receptor_id == "apple-platforms" && m.above_threshold)
+        );
     }
 
     #[tokio::test]
