@@ -218,6 +218,7 @@ pub(crate) async fn spawn_server_manager(
         server_key = %server.server_key,
         receptor_count = attention.receptor_count(),
         degraded = attention.is_degraded(),
+        veto_enforcement_unavailable = attention.is_veto_enforcement_unavailable(),
         "attention layer initialized"
     );
     let generated_embeddings = configured_generated_embedding_clients(&runtime.attention);

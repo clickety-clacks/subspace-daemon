@@ -198,7 +198,6 @@ pub struct StoredAttentionConfig {
     pub local_pack_paths: Vec<String>,
     #[serde(default)]
     pub embedding_backends: Vec<StoredEmbeddingBackend>,
-    pub threshold: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -320,10 +319,6 @@ impl Config {
         let attention = AttentionConfig {
             local_pack_paths: stored.attention.local_pack_paths,
             embedding_backends,
-            threshold: stored
-                .attention
-                .threshold
-                .unwrap_or(crate::attention::DEFAULT_THRESHOLD),
         };
 
         Ok(Self {

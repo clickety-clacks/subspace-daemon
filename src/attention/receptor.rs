@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// Receptor class types as defined in the spec.
+/// Operator-facing receptor class types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceptorClass {
@@ -11,7 +11,7 @@ pub enum ReceptorClass {
     Intersection,
     Project,
     Wildcard,
-    AntiReceptor,
+    Veto,
 }
 
 impl Default for ReceptorClass {
@@ -20,18 +20,29 @@ impl Default for ReceptorClass {
     }
 }
 
+impl ReceptorClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Broad => "broad",
+            Self::Intersection => "intersection",
+            Self::Project => "project",
+            Self::Wildcard => "wildcard",
+            Self::Veto => "veto",
+        }
+    }
+}
+
 /// A single receptor definition as loaded from a receptor pack JSON file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceptorDefinition {
     pub receptor_id: String,
     #[serde(default)]
     pub class: ReceptorClass,
     #[serde(default)]
-    pub description: String,
+    pub query: String,
     #[serde(default)]
-    pub positive_examples: Vec<String>,
-    #[serde(default)]
-    pub negative_examples: Vec<String>,
+    pub threshold: Option<f32>,
 }
 
 /// A receptor pack as loaded from a JSON file.
@@ -50,6 +61,7 @@ pub struct ReceptorPack {
 pub struct ComputedReceptor {
     pub receptor_id: String,
     pub class: ReceptorClass,
+    pub threshold: f32,
     /// None for wildcard class.
     pub vector: Option<Vec<f32>>,
     /// The space_id of the embedding, if computed.
@@ -60,6 +72,10 @@ impl ComputedReceptor {
     /// Returns true if this is a wildcard receptor that matches all messages.
     pub fn is_wildcard(&self) -> bool {
         self.class == ReceptorClass::Wildcard
+    }
+
+    pub fn is_veto(&self) -> bool {
+        self.class == ReceptorClass::Veto
     }
 }
 
@@ -94,15 +110,32 @@ pub fn load_receptor_packs(pack_paths: &[String]) -> Result<Vec<ReceptorDefiniti
         }
     }
 
-    // Validate unique receptor IDs
+    // Validate unique receptor IDs and required authoring fields.
     let mut seen = std::collections::HashSet::new();
     for receptor in &all_receptors {
         if !seen.insert(&receptor.receptor_id) {
             bail!("duplicate receptor_id: {}", receptor.receptor_id);
         }
+        validate_receptor_definition(receptor)?;
     }
 
     Ok(all_receptors)
+}
+
+fn validate_receptor_definition(receptor: &ReceptorDefinition) -> Result<()> {
+    if receptor.receptor_id.trim().is_empty() {
+        bail!("receptor_id must not be empty");
+    }
+    if receptor.class == ReceptorClass::Wildcard {
+        return Ok(());
+    }
+    if receptor.query.trim().is_empty() {
+        bail!("receptor {} requires query", receptor.receptor_id);
+    }
+    if receptor.threshold.is_none() {
+        bail!("receptor {} requires threshold", receptor.receptor_id);
+    }
+    Ok(())
 }
 
 fn load_pack_file(path: &Path) -> Result<Vec<ReceptorDefinition>> {
@@ -133,14 +166,12 @@ mod tests {
                 {
                     "receptor_id": "swift-visionos",
                     "class": "intersection",
-                    "description": "SwiftUI and visionOS changes",
-                    "positive_examples": ["SwiftUI immersive space lifecycle changed"],
-                    "negative_examples": ["Unity mixed reality"]
+                    "query": "SwiftUI immersive space lifecycle changed for visionOS",
+                    "threshold": 0.72
                 },
                 {
                     "receptor_id": "all",
-                    "class": "wildcard",
-                    "description": "Accept all"
+                    "class": "wildcard"
                 }
             ]
         }"#,
@@ -162,8 +193,8 @@ mod tests {
             &pack_path,
             r#"{
             "receptors": [
-                { "receptor_id": "same", "class": "broad" },
-                { "receptor_id": "same", "class": "project" }
+                { "receptor_id": "same", "class": "broad", "query": "one", "threshold": 0.7 },
+                { "receptor_id": "same", "class": "project", "query": "two", "threshold": 0.7 }
             ]
         }"#,
         )
@@ -176,6 +207,77 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate receptor_id")
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_negative_examples_field() {
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("legacy.json");
+        std::fs::write(
+            &pack_path,
+            r#"{
+            "receptors": [
+                {
+                    "receptor_id": "legacy",
+                    "class": "broad",
+                    "query": "valid query",
+                    "threshold": 0.7,
+                    "negative_examples": ["old shape"]
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let result = load_receptor_packs(&[pack_path.to_string_lossy().to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_anti_receptor_class() {
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("anti.json");
+        std::fs::write(
+            &pack_path,
+            r#"{
+            "receptors": [
+                {
+                    "receptor_id": "old-anti",
+                    "class": "anti_receptor",
+                    "query": "legacy anti receptor",
+                    "threshold": 0.7
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let result = load_receptor_packs(&[pack_path.to_string_lossy().to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn requires_query_and_threshold_for_scored_receptors() {
+        let dir = tempdir().unwrap();
+        let pack_path = dir.path().join("missing.json");
+        std::fs::write(
+            &pack_path,
+            r#"{
+            "receptors": [
+                { "receptor_id": "missing", "class": "veto", "query": "spam" }
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let result = load_receptor_packs(&[pack_path.to_string_lossy().to_string()]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires threshold")
         );
     }
 }

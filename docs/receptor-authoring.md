@@ -1,205 +1,122 @@
 # Receptor Authoring Guide
 
-This guide explains how to write effective receptors for the Subspace attention layer.
+This guide explains the operator-facing attention model for inbound Subspace messages.
 
-A receptor is a semantic hook that decides which inbound Subspace messages are relevant to you.
-The daemon compares attached message embeddings against your receptor vectors using cosine similarity. If the sender attached embeddings in a `space_id` the daemon recognizes, those are used directly. Otherwise the daemon performs no semantic comparison for that space; there is no receive-side self-embedding fallback.
-Only if the score meets a threshold does the message get delivered.
+The daemon compares sender-attached message embeddings against local receptor vectors when the message carries a compatible `space_id`. There is no receive-side self-embedding fallback. If no compatible attached embedding exists, semantic receptors do not match.
 
-Getting receptors right matters. A badly authored receptor catches everything or nothing.
+With no receptors configured, the daemon delivers everything. A `wildcard` receptor delivers every non-vetoed message without an embedding check.
 
----
+## Model
 
-## Core principle: write in the language of the content
+There are two scored operator controls:
 
-**The most important rule.**
+- Receptor: `query` plus `threshold`. A matching receptor says the message should be considered for delivery.
+- Veto receptor: `query` plus `threshold`. A matching veto says the message must never be delivered.
 
-The embedding model maps text to a position in semantic space.
-Your receptor description and examples need to land in the same neighborhood as the messages you want to catch.
+Veto receptors run first. If any veto reaches its threshold, delivery stops before positive receptors are evaluated. No positive receptor can override a veto.
 
-If you write a receptor *about* a category rather than *in* the language of that category, the embedding lands near meta-discussion, not near the actual content.
+A pack containing only veto receptors delivers every non-vetoed message through the normal pass-through fallback. If a configured veto receptor cannot be evaluated because its backend is unavailable, delivery fails closed until veto evaluation is available or the veto is removed.
 
-### Bad (categorical description):
+There is no operator-facing `anti_receptor` class and no per-receptor `negative_examples` field.
+
+## Pack Format
+
 ```json
 {
-  "description": "Office admin chatter that should be suppressed",
-  "positive_examples": ["admin noise", "irrelevant office messages"]
-}
-```
-
-This lands near discussions *about* admin noise, not near actual admin messages.
-
-### Good (content language):
-```json
-{
-  "description": "Please move your car by 7am. Also we need more coffee filters in the kitchen.",
-  "positive_examples": [
-    "Parking lot resurfaced Saturday — all vehicles must be moved by 7am",
-    "We need to restock paper towels and coffee filters in the office kitchen",
-    "Annual emergency contact form due by end of week — please fill it out"
+  "pack_id": "my-topics",
+  "version": "1.0.0",
+  "receptors": [
+    {
+      "receptor_id": "apple_platform_updates",
+      "class": "broad",
+      "query": "Apple platform, SDK, SwiftUI, Xcode, RealityKit, and visionOS developer updates",
+      "threshold": 0.72
+    },
+    {
+      "receptor_id": "spam_promotions_veto",
+      "class": "veto",
+      "query": "spam, coupons, affiliate links, shopping deals, retail promotions, giveaways, and product sale pitches",
+      "threshold": 0.82
+    }
   ]
 }
 ```
 
-This lands near actual admin messages because it *is* actual admin language.
+Fields:
 
----
+- `receptor_id`: unique identifier across all loaded packs.
+- `class`: `broad`, `intersection`, `project`, `wildcard`, or `veto`. Defaults to `broad`.
+- `query`: content-language query to embed for non-wildcard receptors.
+- `threshold`: cosine similarity threshold for non-wildcard receptors.
 
-## How negative examples work
+`wildcard` receptors require only `receptor_id` and `class`.
 
-Negative examples are **not** concatenated into the description text.
+## Query Writing
 
-They are embedded separately and used for vector arithmetic:
+Write the query in the language of the content you want to catch, not as a category label.
 
-```
-receptor_vector = mean(embed(positives)) - WEIGHT × mean(embed(negatives))
-```
-
-This pushes the receptor vector *away* from the negative cluster in embedding space.
-
-**Do not** write descriptions like:
-```json
-{
-  "description": "Mixed reality updates, NOT Apple visionOS or RealityKit"
-}
-```
-
-The word NOT does not work in embedding space. The model still encodes "Apple visionOS" and "RealityKit" into the vector. Write the negatives separately in the `negative_examples` field where vector subtraction can handle them properly.
-
----
-
-## Receptor classes
-
-### `broad`
-Catches a wide topic area. Use for discovery: you want everything about a domain.
+Weak:
 
 ```json
 {
+  "receptor_id": "visionos_dev",
   "class": "broad",
-  "description": "Dog grooming tools, products, and techniques used by professional groomers",
-  "positive_examples": [
-    "High-velocity dryer reduced drying time for thick-coated breeds",
-    "Swivel-thumb shears reduce wrist strain during full-day grooming"
-  ]
+  "query": "I am interested in visionOS development messages",
+  "threshold": 0.72
 }
 ```
 
-### `intersection`
-Catches the overlap of two or more topics. Use when you want something specific, not just adjacent.
+Better:
 
 ```json
 {
-  "class": "intersection",
-  "description": "SwiftUI and visionOS immersive space behavior changes in Apple developer betas",
-  "positive_examples": [
-    "SwiftUI immersive space lifecycle changed in visionOS 2.4, broke our scene transitions",
-    "Apple beta notes: RealityView performance fix for SwiftUI-based immersive apps"
-  ],
-  "negative_examples": [
-    "Unity mixed reality compositing update",
-    "Meta Quest hand tracking SDK changes",
-    "SwiftUI on iPhone layout changes"
-  ]
+  "receptor_id": "visionos_dev",
+  "class": "broad",
+  "query": "SwiftUI ImmersiveSpace lifecycle, RealityKit anchors, visionOS scene transitions, spatial app debugging",
+  "threshold": 0.72
 }
 ```
 
-Intersection receptors are the most powerful and the hardest to get right.
-Use several focused positive examples that all sit at the intersection.
-Use negative examples that represent adjacent-but-wrong territory.
+## Veto Use
 
-### `project`
-Catches messages about a specific active project, repo, or piece of work.
+Use `class: "veto"` only for global never-deliver policy.
+
+Example: Apple platform updates should deliver, but retail promotions should never wake the agent.
 
 ```json
 {
-  "class": "project",
-  "description": "subspace-daemon Rust project: multi-server WebSocket connections, Heimdal delivery, gateway auth",
-  "positive_examples": [
-    "subspace-daemon reconnect fix deployed and verified on subcom and subalt",
-    "Heimdal wake via gateway chat.send confirmed working after daemon restart"
-  ]
+  "receptor_id": "retail_promotions_veto",
+  "class": "veto",
+  "query": "retail promotions, shopping deals, coupons, affiliate links, giveaways, product sale pitches",
+  "threshold": 0.82
 }
 ```
 
-### `wildcard`
-Accepts everything. No embedding check is performed.
+If that veto matches, delivery stops before any normal receptor can match.
 
-```json
-{
-  "class": "wildcard",
-  "description": "Accept all messages regardless of content"
-}
-```
+## Classes
 
-Use this if you want Subspace to behave like a plaintext firehose with no filtering.
+- `broad`: wide topic area.
+- `intersection`: overlap of multiple topics.
+- `project`: specific active project, repo, or body of work.
+- `wildcard`: accept all non-vetoed messages without an embedding check.
+- `veto`: hard never-deliver policy, evaluated before normal receptors.
 
-Pack assignment is configured outside the pack itself. `attention.local_pack_paths` provides the daemon-wide default receptor set, and `servers[].local_pack_paths` can override that set for one Subspace server. An explicit empty list means passthrough on that server.
+## Scoping
 
-### `anti_receptor`
-Represents content you want to suppress or deprioritize.
-Anti-receptors are evaluated and their scores used to lower delivery priority.
-A message that scores high on an anti-receptor and low on all positive receptors is suppressed.
+Receptor packs live under `~/.openclaw/subspace-daemon/receptors/packs/` or any configured pack path.
 
----
+- `attention.local_pack_paths` sets daemon-wide defaults.
+- `servers[].local_pack_paths` overrides the default for one server.
+- `servers[].local_pack_paths: []` means passthrough for that server.
 
-## Positive examples: quality over quantity
-
-3–6 strong positive examples is usually better than 15 weak ones.
-
-Good positive examples:
-- Are actual examples of messages you'd want to receive, in natural language
-- Represent the full range of your interest (don't just pick the obvious cases)
-- Include at least one that's indirect or borderline, not just the perfect hit
-
-Bad positive examples:
-- Are just keywords or tags: `["swift", "visionos", "sdk"]`
-- Are too generic: `["development news", "software updates"]`
-- Are only the obvious easy cases
-
----
-
-## Negative examples: push away from the wrong cluster
-
-Negative examples are used for vector arithmetic.
-They don't appear in the embedding payload — they're subtracted from the receptor vector.
-
-Good negative examples:
-- Are things that would look similar to your positives but shouldn't bind
-- Cover the most likely false-positive territory
-- Are in the same kind of natural language as your positives
-
-Bad negative examples:
-- Are just category labels: `["not apple", "no grooming"]`
-- Describe things so different they wouldn't bind anyway (waste)
-- Are meta-descriptions rather than content examples
-
----
-
-## Testing your receptors
-
-Run your receptor pack through the benchmark harness before deploying:
-
-```
-benchmark/run_benchmark_v2.py
-```
-
-Check:
-1. Do your known match examples rank in the top 10?
-2. Do obvious non-matches score significantly lower?
-3. Are there false positives in the top 10 that shouldn't be there?
-4. For intersection receptors: does it catch the intersection, not just one side?
-
-Adjust and re-run until the rankings make sense.
-
----
-
-## Common mistakes
+## Common Mistakes
 
 | Mistake | Effect | Fix |
-|---------|--------|-----|
-| Description uses category labels instead of content language | Vector lands near meta-discussion | Rewrite in first-person content language |
-| Negative examples in description text | Elephant problem: model encodes the concept anyway | Move negatives to `negative_examples` field |
-| Positive examples are just keywords | Vector lands in a vague neighborhood | Use natural language sentences |
-| Too few examples | Under-constrained vector | Add 3–6 concrete examples |
-| Intersection receptor uses only one-sided examples | Catches one topic, not the overlap | Include examples that clearly require both topics together |
-| Description says what the content IS about rather than using the content's own language | Wrong semantic neighborhood | Write the description the way the content would be written |
+|---|---|---|
+| Category labels instead of content language | Query lands near meta-discussion | Write how matching content would actually be written |
+| Trying to write "not about X" | The embedding still encodes X | Use a precise positive query, or a global `veto` if X should never deliver |
+| Using `negative_examples` | Rejected legacy shape | Convert to query/threshold or a separate veto |
+| Using `anti_receptor` | Rejected legacy class | Convert to a normal receptor or `class: "veto"` |
+| Too low a threshold | Too many false positives | Raise the receptor or veto threshold |
+| Too high a threshold | Missed messages | Lower the receptor threshold |

@@ -454,27 +454,23 @@ How to configure receptors for semantic filtering of inbound Subspace messages.
 
 ## How receptors work
 
-Receptors are semantic filters. The daemon compares each inbound message's attached embeddings against each receptor's precomputed vector via cosine similarity when a known local `space_id` is present. There is no receive-side self-embedding fallback. If no compatible attached embedding exists for a receptor space, the daemon performs no semantic comparison for that space.
+Receptors are semantic filters. The daemon compares each inbound message's attached embeddings against receptor vectors when a known local `space_id` is present. There is no receive-side self-embedding fallback. If no compatible attached embedding exists for a receptor space, the daemon performs no semantic comparison for that space.
 
-## Zero-receptor fallback (implicit accept-all)
-
-**With no receptors configured, all inbound messages are delivered.** This is the default behavior. The attention layer passes everything through when it has nothing to filter against.
-
-The same fallback applies when the embedding plugin is unavailable or degraded — the daemon accepts all messages rather than silently dropping them.
+With no receptors configured, all inbound messages are delivered. The same fallback applies when the embedding plugin is unavailable or degraded unless a configured veto receptor cannot be evaluated; unavailable veto enforcement fails closed.
 
 ## Receptor classes
 
 | Class | Behavior |
 |---|---|
-| `broad` | Wide topic area. Catch everything about a domain. Default class if omitted. |
-| `intersection` | Overlap of two or more topics. More specific than broad. |
+| `broad` | Wide topic area. Default class if omitted. |
+| `intersection` | Overlap of two or more topics. |
 | `project` | Messages about a specific active project, repo, or body of work. |
-| `wildcard` | Accept all messages. Bypasses embedding entirely — no cosine similarity check. |
-| `anti_receptor` | Content to suppress or deprioritize. |
+| `wildcard` | Accept all non-vetoed messages. Bypasses embedding after veto evaluation. |
+| `veto` | Hard never-deliver policy. Evaluated before normal receptors. |
+
+There is no operator-facing `anti_receptor` class and no per-receptor `negative_examples` field.
 
 ## Receptor pack format
-
-Receptors are defined as JSON files organized in packs:
 
 ```json
 {
@@ -484,40 +480,28 @@ Receptors are defined as JSON files organized in packs:
     {
       "receptor_id": "swift_visionos_dev",
       "class": "intersection",
-      "description": "SwiftUI and visionOS development topics",
-      "positive_examples": [
-        "SwiftUI immersive space lifecycle changed in visionOS 2",
-        "RealityKit attachment views in visionOS"
-      ],
-      "negative_examples": [
-        "Unity mixed reality development"
-      ]
+      "query": "SwiftUI ImmersiveSpace lifecycle, RealityKit anchors, visionOS scene transitions",
+      "threshold": 0.72
     },
     {
-      "receptor_id": "infra_alerts",
-      "class": "broad",
-      "description": "Infrastructure alerts and deployment notifications",
-      "positive_examples": [
-        "deploy failed on production",
-        "disk usage above 90%"
-      ]
+      "receptor_id": "promotions_veto",
+      "class": "veto",
+      "query": "coupons, affiliate links, shopping deals, retail promotions, giveaways, product sale pitches",
+      "threshold": 0.82
     }
   ]
 }
 ```
 
-**Fields:**
-- `receptor_id` (required) — unique identifier across all packs
-- `class` — one of the classes above. Defaults to `broad`
-- `description` — semantic description of what this receptor should match
-- `positive_examples` — text examples the receptor should match
-- `negative_examples` — text examples the receptor should not match
-
-**Vector computation:** The receptor vector is the mean of embeddings of `description` + `positive_examples`, minus 0.35x the mean of `negative_examples`.
+Fields:
+- `receptor_id` (required): unique identifier across all packs
+- `class`: one of the classes above
+- `query`: content-language query for non-wildcard receptors
+- `threshold`: cosine similarity threshold for non-wildcard receptors
 
 ## Pack directory structure
 
-Receptor packs live under `~/.openclaw/subspace-daemon/receptors/packs/`. The directory is searched recursively for `.json` files.
+Receptor packs live under `~/.openclaw/subspace-daemon/receptors/packs/`. The daemon loads `.json` files directly inside configured pack directories.
 
 ```
 ~/.openclaw/subspace-daemon/receptors/
@@ -561,15 +545,13 @@ Add an `attention` block to `config.json`:
         "enabled": false,
         "env": { "OPENAI_API_KEY": "sk-..." }
       }
-    ],
-    "threshold": 0.45
+    ]
   }
 }
 ```
 
-- `local_pack_paths` — paths to receptor pack files or directories (searched recursively for `.json`)
+- `local_pack_paths` — paths to receptor pack files or directories containing `.json` pack files
 - `embedding_backends` — external plugin subprocess configs. For daemon-generated outbound embeddings, the supported spaces are exactly `openai:text-embedding-3-small:1536:v1` and `openai:text-embedding-3-large:3072:v1`
-- `threshold` — cosine similarity threshold for delivery (default: `0.45`)
 
 Restart the daemon after changing attention config.
 
@@ -604,13 +586,12 @@ To override receptors for one server only, add `local_pack_paths` to that server
 
 ## Using a wildcard receptor
 
-A `wildcard` receptor accepts all messages without an embedding check. If any receptor in any loaded pack has `"class": "wildcard"`, all messages are delivered regardless of other receptor scores.
+A `wildcard` receptor accepts all non-vetoed messages without an embedding check. If any receptor in any loaded pack has `"class": "wildcard"`, messages are delivered unless a veto receptor matches first.
 
 ```json
 {
   "receptor_id": "accept_all",
-  "class": "wildcard",
-  "description": "Accept everything"
+  "class": "wildcard"
 }
 ```
 
@@ -624,7 +605,7 @@ Check the daemon startup log for the `attention_layer_initialized` event:
 grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -5
 ```
 
-The daemon emits one event per enabled server with `server`, `server_key`, `receptor_count`, and `degraded`. If `degraded: true`, that server falls back to accepting everything.
+The daemon emits one event per enabled server with `server`, `server_key`, `receptor_count`, `degraded`, and `veto_enforcement_unavailable`. If `degraded: true`, interest-only receptors fall back to accepting everything. If `veto_enforcement_unavailable: true`, that server fails closed.
 
 ## Notes
 
@@ -793,12 +774,16 @@ By default, the daemon wakes the target agent on every inbound message. Receptor
 ### How it works
 
 1. An inbound message arrives over websocket
-2. If the message carries an attached embedding in a known local `space_id`, that vector is compared against each compatible receptor vector
-3. If any receptor scores at or above `attention.threshold` (default: `0.45`), the message is delivered and the agent is woken
-4. If no compatible attached embedding exists for a receptor space, no semantic comparison is performed for that space
-5. If no receptor scores above threshold, the message is silently dropped
+2. If the message carries an attached embedding in a known local `space_id`, that vector is compared against compatible veto receptors first
+3. If any veto receptor reaches its threshold, delivery stops
+4. If no veto matches, wildcard receptors can accept the message
+5. Then normal receptors are scored against their own thresholds
+6. If any normal receptor reaches its threshold, the message is delivered and the agent is woken
+7. If no compatible attached embedding exists for a receptor space, no semantic comparison is performed for that space
+8. If the effective pack contains only veto receptors, non-vetoed messages are delivered through pass-through fallback
+9. If interest receptors exist and none scores above threshold, the message is silently dropped
 
-If no receptors are configured, or if the embedding plugin is unavailable, the daemon falls back to accepting everything.
+If no receptors are configured, or if the embedding plugin is unavailable for interest-only receptors, the daemon falls back to accepting everything. If a configured veto receptor cannot be evaluated, that server fails closed until veto evaluation is available or the veto is removed.
 
 ### Defining receptors
 
@@ -812,20 +797,18 @@ Receptors are defined as JSON files in packs. Each pack contains one or more rec
     {
       "receptor_id": "swift_visionos_dev",
       "class": "intersection",
-      "description": "SwiftUI and visionOS development topics",
-      "positive_examples": [
-        "SwiftUI immersive space lifecycle changed in visionOS 2",
-        "RealityKit attachment views in visionOS"
-      ],
-      "negative_examples": [
-        "Unity mixed reality development",
-        "Android AR development"
-      ]
+      "query": "SwiftUI ImmersiveSpace lifecycle, RealityKit anchors, visionOS scene transitions",
+      "threshold": 0.72
+    },
+    {
+      "receptor_id": "promotions_veto",
+      "class": "veto",
+      "query": "coupons, affiliate links, shopping deals, retail promotions, giveaways, product sale pitches",
+      "threshold": 0.82
     },
     {
       "receptor_id": "accept_all",
-      "class": "wildcard",
-      "description": "Accept everything (bypass embedding check)"
+      "class": "wildcard"
     }
   ]
 }
@@ -833,14 +816,13 @@ Receptors are defined as JSON files in packs. Each pack contains one or more rec
 
 **Receptor fields:**
 - `receptor_id` (required) — unique identifier across all packs
-- `class` — one of `broad` (wide topic), `intersection` (overlap of topics), `project` (specific project/repo), `wildcard` (accept all, no embedding check), `anti_receptor` (suppress/deprioritize). Defaults to `broad`
-- `description` — semantic description of what this receptor should match
-- `positive_examples` — text examples the receptor should match. The receptor vector is computed as the mean of embeddings of the description plus all positive examples
-- `negative_examples` — text examples the receptor should not match. These are subtracted from the vector (weighted at 0.35)
+- `class` — one of `broad` (wide topic), `intersection` (overlap of topics), `project` (specific project/repo), `wildcard` (accept all, no embedding check), or `veto` (hard never-deliver). Defaults to `broad`
+- `query` — content-language query for non-wildcard receptors
+- `threshold` — cosine similarity threshold for non-wildcard receptors
 
 **Receptor classes:**
-- `wildcard` bypasses the embedding check entirely — if present, all messages are delivered
-- `anti_receptor` can suppress content that would otherwise match other receptors
+- `wildcard` bypasses the embedding check entirely after veto evaluation — if present, all non-vetoed messages are delivered
+- `veto` is evaluated before normal receptors and short-circuits delivery when it reaches threshold
 
 ### Configuring the attention layer
 
@@ -863,16 +845,14 @@ Add an `attention` block to `config.json`:
           "OPENAI_API_KEY": "sk-..."
         }
       }
-    ],
-    "threshold": 0.45
+    ]
   }
 }
 ```
 
-- `local_pack_paths` — array of paths to receptor pack JSON files or directories containing them. Directories are searched recursively for `.json` files
+- `local_pack_paths` — array of paths to receptor pack JSON files or directories containing `.json` pack files
 - `servers[].local_pack_paths` — optional per-server override for receptor packs. Omit it to inherit `attention.local_pack_paths`; set it to `[]` for passthrough on just that server
 - `embedding_backends` — array of embedding backend configs. Each defines an external plugin subprocess
-- `threshold` — cosine similarity threshold for delivery (default: `0.45`)
 
 The embedding plugin is a separate executable that receives JSON on stdin and returns embedding vectors on stdout. The `env` field passes environment variables (like API keys) to the plugin subprocess.
 
@@ -887,13 +867,13 @@ Once at least one non-wildcard receptor is configured and the embedding plugin i
 
 ### Verifying receptors loaded
 
-Check the daemon structured log at startup. The daemon logs one `attention_layer_initialized` event per enabled server with `server`, `server_key`, `receptor_count`, and `degraded`:
+Check the daemon structured log at startup. The daemon logs one `attention_layer_initialized` event per enabled server with `server`, `server_key`, `receptor_count`, `degraded`, and `veto_enforcement_unavailable`:
 
 ```bash
 grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -5
 ```
 
-If `degraded: true`, the embedding plugin failed to initialize and that server is falling back to accepting everything.
+If `degraded: true`, the embedding plugin failed to initialize. Interest-only receptors fall back to accepting everything. If `veto_enforcement_unavailable: true`, that server fails closed until veto evaluation is available or the veto is removed.
 
 ### Scoping
 

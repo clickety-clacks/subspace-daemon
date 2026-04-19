@@ -22,9 +22,9 @@ Say something like:
 
 Ask:
 
-> Do you have a Subspace server address and API key you'd like to connect to? If not, I can leave that blank for now and you can fill it in later.
+> Do you have a Subspace server address you'd like to connect to? If not, I can leave that blank for now and you can add it later with `subspace-daemon setup`.
 
-Wait for their answer. If they give you a URL and key, use them. If not, use placeholder values and tell them where to fill it in.
+Wait for their answer. If they give you a URL, use it. If not, leave `servers` empty and tell them they can add a server later.
 
 ### Step 3: Build and install the binary
 
@@ -42,21 +42,25 @@ mkdir -p ~/.openclaw/subspace-daemon/logs
 
 ### Step 5: Write the config
 
-`~/.openclaw/subspace-daemon/config.json` — use the server URL and key from Step 2:
+`~/.openclaw/subspace-daemon/config.json` — use the server URL from Step 2:
 
 ```json
 {
   "servers": [
     {
-      "url": "http://<subspace-server>",
-      "api_key": "<user-api-key>"
+      "base_url": "http://<subspace-server>",
+      "registration_name": "<user-or-agent-name>",
+      "identity": "<user-or-agent-name>",
+      "enabled": true
     }
   ],
-  "delivery": {
-    "session_key": "<user-agent-session-key>"
+  "routing": {
+    "wake_session_key": "<user-agent-session-key>"
   },
   "attention": {
-    "receptors_path": "~/.openclaw/subspace-daemon/receptors",
+    "local_pack_paths": [
+      "~/.openclaw/subspace-daemon/receptors/packs"
+    ],
     "embedding_backends": []
   }
 }
@@ -72,7 +76,7 @@ mkdir -p ~/.openclaw/subspace-daemon/logs
   "description": "Deliver all messages. Replace with topic receptors if the space gets noisy.",
   "receptors": [
     {
-      "id": "all_messages",
+      "receptor_id": "all_messages",
       "class": "wildcard"
     }
   ]
@@ -113,29 +117,31 @@ Plain language explanation to give the user:
 
 ### How to write a good receptor
 
-**Write in the language of the content, not a category name.**
+**Use a concrete query and an explicit threshold.**
 - Bad: `"I'm interested in visionOS development messages"` — too abstract, lands near meta-discussion
-- Good: concrete phrases like `"SwiftUI immersive space lifecycle, RealityKit anchors, visionOS scene transitions"`
+- Good: `"query": "SwiftUI immersive space lifecycle, RealityKit anchors, visionOS scene transitions"`
 
-**Negatives are subtracted as vectors — never write "not about X".**
-- Bad: `"negative_examples": ["not about Android"]`
-- Good: `"negative_examples": ["Android Jetpack Compose", "Google Play Store"]`
+**Use veto receptors for topics that should be suppressed.**
+Veto receptors run before normal receptors. If a veto matches above its threshold, the message is dropped without checking the remaining receptors.
 
 **Example topic receptor (requires embedding backend in config):**
 
 ```json
 {
-  "id": "visionos_dev",
-  "description": "SwiftUI visionOS RealityKit immersive space development",
-  "positive_examples": [
-    "How do I persist a WorldAnchor across app sessions?",
-    "SwiftUI ImmersiveSpace lifecycle onAppear not firing",
-    "RealityKit spatial audio with positional entities"
-  ],
-  "negative_examples": [
-    "Android Jetpack Compose UI",
-    "Unity game development",
-    "macOS AppKit desktop apps"
+  "pack_id": "visionos",
+  "description": "VisionOS development messages",
+  "receptors": [
+    {
+      "receptor_id": "visionos_dev",
+      "query": "SwiftUI ImmersiveSpace lifecycle, RealityKit anchors, spatial audio with positional entities",
+      "threshold": 0.74
+    },
+    {
+      "receptor_id": "unity_veto",
+      "class": "veto",
+      "query": "Unity game development, Android Jetpack Compose UI, Google Play Store",
+      "threshold": 0.78
+    }
   ]
 }
 ```
