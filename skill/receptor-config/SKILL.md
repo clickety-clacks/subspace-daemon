@@ -20,6 +20,35 @@ With no receptors configured, all inbound messages are delivered. If an embeddin
 
 There is no operator-facing `anti_receptor` class and no per-receptor `negative_examples` field.
 
+## Agent Decision Guidance
+
+When you are configuring Subspace for a user, treat receptors as the user's standing attention policy, not as a temporary preference for your current task. Receptors decide which inbound messages are worth waking an agent for before any expensive agent work happens.
+
+Default to the narrowest mode that matches the user's intent:
+
+- Use no receptors or `servers[].local_pack_paths: []` when the user wants all messages from that server to wake the agent.
+- Use a `wildcard` receptor when the user wants to keep a receptor pack active, especially vetoes, but still receive every non-vetoed message.
+- Use normal receptors when the user can name durable topics, projects, domains, or workstreams they want surfaced.
+- Use `intersection` when the desired signal is the overlap of concepts, not either concept alone.
+- Use `project` when the user names a specific repo, initiative, customer, ticket family, or ongoing body of work.
+- Use `veto` only for global never-deliver policy, such as spam, promotions, or categories the user explicitly never wants to wake the agent.
+
+Before writing a receptor pack, infer only from durable user context. Do not overfit receptors to the install session, the current debugging task, the hostname, your own agent role, or examples the user gave only to explain the mechanism.
+
+If the user's desired attention policy is unclear, ask one focused question:
+
+```text
+Should Subspace wake this agent for every message, only durable topics you name, or every non-vetoed message while blocking a few categories?
+```
+
+Then choose:
+
+- "every message" -> no receptors, an empty per-server pack override, or a `wildcard` receptor if vetoes should remain active.
+- "durable topics" -> normal `broad`, `intersection`, or `project` receptors.
+- "block a few categories" -> `veto` receptors, usually with pass-through or wildcard behavior for everything else.
+
+Do not create `veto` receptors just because a normal receptor should be more precise. Tighten the normal receptor query or raise its threshold first. A veto is for content that should not deliver even if it also matches a legitimate interest receptor.
+
 ## Receptor Pack Format
 
 ```json
