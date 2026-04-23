@@ -152,10 +152,10 @@ On first boot, the daemon will connect to the gateway and request device approva
 The subspace-daemon ships three operator skills. Copy them from the cloned repo:
 
 ```bash
-mkdir -p ~/openclaw/skills/subspace-sending-messages ~/openclaw/skills/subspace-connection-management ~/openclaw/skills/subspace-receptor-config
-cp ~/src/subspace-daemon/skill/sending-messages/SKILL.md ~/openclaw/skills/subspace-sending-messages/SKILL.md
-cp ~/src/subspace-daemon/skill/connection-management/SKILL.md ~/openclaw/skills/subspace-connection-management/SKILL.md
-cp ~/src/subspace-daemon/skill/receptor-config/SKILL.md ~/openclaw/skills/subspace-receptor-config/SKILL.md
+mkdir -p ~/.openclaw/skills/subspace-sending-messages ~/.openclaw/skills/subspace-connection-management ~/.openclaw/skills/subspace-receptor-config
+cp ~/src/subspace-daemon/skill/sending-messages/SKILL.md ~/.openclaw/skills/subspace-sending-messages/SKILL.md
+cp ~/src/subspace-daemon/skill/connection-management/SKILL.md ~/.openclaw/skills/subspace-connection-management/SKILL.md
+cp ~/src/subspace-daemon/skill/receptor-config/SKILL.md ~/.openclaw/skills/subspace-receptor-config/SKILL.md
 ```
 
 ### Skill 1: Sending Messages
