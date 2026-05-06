@@ -8,7 +8,8 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::attention::{
-    AttentionLayer, AttentionResult, MessageEmbedding, format_attention_annotation,
+    AttentionDisposition, AttentionLayer, AttentionResult, MessageEmbedding,
+    format_attention_annotation,
 };
 use crate::config::{Config, RetryConfig};
 use crate::gateway::client::{GatewayClientHandle, start_gateway_client};
@@ -381,16 +382,62 @@ async fn process_wake_queue(
             )
             .await;
 
-        if !attention_result.deliver {
-            // Message filtered out by attention layer
+        if attention_result.veto_not_evaluated {
             info!(
                 component = "wake_router",
-                event = "message_filtered",
+                event = "veto_not_evaluated",
                 message_id = %item.message_id,
                 server = %item.server,
-                top_score = attention_result.matches.first().map(|m| m.score),
-                "message filtered by attention layer"
+                space_id = attention_result.space_id.as_deref(),
+                "veto receptors were not evaluated because no compatible supplied embedding was available"
             );
+        }
+
+        if !attention_result.deliver {
+            match attention_result.disposition {
+                AttentionDisposition::Vetoed => {
+                    let receptor_ids = attention_result
+                        .matches
+                        .iter()
+                        .filter(|receptor_match| {
+                            receptor_match.class.as_str() == "veto"
+                                && receptor_match.above_threshold
+                        })
+                        .map(|receptor_match| receptor_match.receptor_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    info!(
+                        component = "wake_router",
+                        event = "message_vetoed",
+                        message_id = %item.message_id,
+                        server = %item.server,
+                        receptor_ids = %receptor_ids,
+                        top_score = attention_result.matches.first().map(|m| m.score),
+                        space_id = attention_result.space_id.as_deref(),
+                        "message vetoed by attention layer"
+                    );
+                }
+                AttentionDisposition::VetoEnforcementUnavailable => {
+                    info!(
+                        component = "wake_router",
+                        event = "message_filtered",
+                        reason = "veto_enforcement_unavailable",
+                        message_id = %item.message_id,
+                        server = %item.server,
+                        "message filtered because veto enforcement is unavailable"
+                    );
+                }
+                AttentionDisposition::Filtered | AttentionDisposition::Deliver => {
+                    info!(
+                        component = "wake_router",
+                        event = "message_filtered",
+                        message_id = %item.message_id,
+                        server = %item.server,
+                        top_score = attention_result.matches.first().map(|m| m.score),
+                        "message filtered by attention layer"
+                    );
+                }
+            }
             // Mark as processed so we don't retry
             let mut runtime = item.runtime.lock().await;
             runtime.mark_processed(&item.message_id, &item.timestamp);

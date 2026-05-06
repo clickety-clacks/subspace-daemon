@@ -15,6 +15,7 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use crate::attention::{AttentionLayer, MessageEmbedding};
 use crate::config::{
     Config, StoredConfig, canonicalize_base_url, default_config_path, default_registration_name,
     derive_app_paths, derive_server_key,
@@ -26,6 +27,7 @@ use crate::subspace::identity::{LoadedSessionRecord, load_session_record};
 use crate::supervisor::run_supervisor;
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(name = "subspace-daemon")]
@@ -46,6 +48,7 @@ enum Command {
     Serve(ServeArgs),
     Send(SendArgs),
     Setup(SetupArgs),
+    EvalAttention(EvalAttentionArgs),
 }
 
 #[derive(Args, Debug)]
@@ -74,6 +77,18 @@ struct SetupArgs {
     identity: Option<String>,
 }
 
+#[derive(Args, Debug, Clone)]
+struct EvalAttentionArgs {
+    #[arg(long, default_value = "~/.openclaw/subspace-daemon/config.json")]
+    config: PathBuf,
+    #[arg(long)]
+    server: String,
+    #[arg(long)]
+    embedding_json: PathBuf,
+    #[arg(long, default_value = "local non-live attention evaluation")]
+    text: String,
+}
+
 fn argv0_mode() -> Option<&'static str> {
     let argv0 = std::env::args_os().next()?;
     let stem = PathBuf::from(argv0);
@@ -96,6 +111,7 @@ async fn main() -> Result<()> {
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Send(args)) => send(args).await,
         Some(Command::Setup(args)) => setup(args).await,
+        Some(Command::EvalAttention(args)) => eval_attention(args).await,
         None => {
             serve(ServeArgs {
                 config: default_config_path(),
@@ -167,6 +183,121 @@ async fn setup(args: SetupArgs) -> Result<()> {
     };
     print_setup_result(&result);
     Ok(())
+}
+
+async fn eval_attention(args: EvalAttentionArgs) -> Result<()> {
+    let config = Config::load(args.config)?;
+    let _guards = logging::init_logging(
+        &config.paths.log_file,
+        &config.logging.level,
+        config.logging.json,
+    )?;
+    let server = config
+        .servers
+        .iter()
+        .find(|server| server.base_url == args.server || server.server_key == args.server)
+        .ok_or_else(|| anyhow::anyhow!("configured server not found: {}", args.server))?;
+    let attention_config = crate::attention::AttentionConfig {
+        local_pack_paths: server.effective_local_pack_paths(&config.attention.local_pack_paths),
+        ..config.attention.clone()
+    };
+    let attention = AttentionLayer::new(attention_config).await?;
+    let embeddings = load_eval_embeddings(&args.embedding_json)?;
+    let result = attention.evaluate(&args.text, &embeddings).await;
+    log_eval_attention_decision(&args.server, &result);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "deliver": result.deliver,
+            "disposition": result.disposition,
+            "fallback": result.fallback,
+            "space_id": result.space_id,
+            "veto_not_evaluated": result.veto_not_evaluated,
+            "veto_enforcement_state": attention.veto_enforcement_state(),
+            "matches": result.matches,
+        }))?
+    );
+    Ok(())
+}
+
+fn log_eval_attention_decision(server: &str, result: &crate::attention::AttentionResult) {
+    let message_id = "local_eval";
+    if result.veto_not_evaluated {
+        info!(
+            component = "wake_router",
+            event = "veto_not_evaluated",
+            message_id,
+            server,
+            space_id = result.space_id.as_deref(),
+            "veto receptors were not evaluated because no compatible supplied embedding was available"
+        );
+    }
+    match result.disposition {
+        crate::attention::AttentionDisposition::Vetoed => {
+            let receptor_ids = result
+                .matches
+                .iter()
+                .filter(|receptor_match| {
+                    receptor_match.class.as_str() == "veto" && receptor_match.above_threshold
+                })
+                .map(|receptor_match| receptor_match.receptor_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            info!(
+                component = "wake_router",
+                event = "message_vetoed",
+                message_id,
+                server,
+                receptor_ids = %receptor_ids,
+                top_score = result.matches.first().map(|m| m.score),
+                space_id = result.space_id.as_deref(),
+                "message vetoed by attention layer"
+            );
+        }
+        crate::attention::AttentionDisposition::VetoEnforcementUnavailable => {
+            info!(
+                component = "wake_router",
+                event = "message_filtered",
+                reason = "veto_enforcement_unavailable",
+                message_id,
+                server,
+                "message filtered because veto enforcement is unavailable"
+            );
+        }
+        crate::attention::AttentionDisposition::Filtered
+        | crate::attention::AttentionDisposition::Deliver => {}
+    }
+}
+
+fn load_eval_embeddings(path: &PathBuf) -> Result<Vec<MessageEmbedding>> {
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let Some(space_id) = value.get("space_id").and_then(serde_json::Value::as_str) else {
+        bail!("embedding_json must include top-level space_id");
+    };
+    let vectors = value
+        .get("vectors")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("embedding_json must include vectors[]"))?;
+    let Some(first_vector) = vectors.first() else {
+        bail!("embedding_json vectors[] must not be empty");
+    };
+    let vector_value = first_vector
+        .get("vector")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("embedding_json vectors[0].vector must be an array"))?;
+    let vector = vector_value
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|number| number as f32)
+                .ok_or_else(|| anyhow::anyhow!("embedding vector values must be numbers"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(vec![MessageEmbedding {
+        space_id: space_id.to_string(),
+        vector,
+    }])
 }
 
 fn validate_registration_name(name: String) -> Result<String> {

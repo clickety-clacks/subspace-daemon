@@ -56,8 +56,17 @@ pub struct OutboundEmbeddingRequest {
     pub generated_embeddings_override_supplied: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionDisposition {
+    Deliver,
+    Filtered,
+    Vetoed,
+    VetoEnforcementUnavailable,
+}
+
 /// A match result for a single receptor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReceptorMatch {
     pub receptor_id: String,
     pub class: ReceptorClass,
@@ -77,6 +86,8 @@ pub struct AttentionResult {
     pub space_id: Option<String>,
     /// Whether this was a fallback decision (no receptors or plugin failure).
     pub fallback: bool,
+    pub disposition: AttentionDisposition,
+    pub veto_not_evaluated: bool,
 }
 
 /// The attention layer handles receptor-based message filtering.
@@ -303,6 +314,8 @@ impl AttentionLayer {
                 matches: Vec::new(),
                 space_id: self.space_id.clone(),
                 fallback: false,
+                disposition: AttentionDisposition::VetoEnforcementUnavailable,
+                veto_not_evaluated: false,
             };
         }
 
@@ -313,6 +326,8 @@ impl AttentionLayer {
                 matches: Vec::new(),
                 space_id: None,
                 fallback: true,
+                disposition: AttentionDisposition::Deliver,
+                veto_not_evaluated: false,
             };
         }
 
@@ -323,11 +338,15 @@ impl AttentionLayer {
                 matches: Vec::new(),
                 space_id: self.space_id.clone(),
                 fallback: true,
+                disposition: AttentionDisposition::Deliver,
+                veto_not_evaluated: false,
             };
         }
 
         let has_interest_receptor = self.receptors.iter().any(|receptor| !receptor.is_veto());
         let selected_vector = self.select_message_vector(supplied_embeddings);
+        let has_veto_receptor = self.receptors.iter().any(|receptor| receptor.is_veto());
+        let veto_not_evaluated = has_veto_receptor && selected_vector.is_none();
 
         let mut matches = Vec::new();
         if let Some((message_vector, vector_space_id)) = &selected_vector {
@@ -354,6 +373,8 @@ impl AttentionLayer {
                         matches,
                         space_id: Some(vector_space_id.clone()),
                         fallback: false,
+                        disposition: AttentionDisposition::Vetoed,
+                        veto_not_evaluated: false,
                     };
                 }
             }
@@ -365,6 +386,8 @@ impl AttentionLayer {
                 matches,
                 space_id: selected_vector.map(|(_, space_id)| space_id),
                 fallback: true,
+                disposition: AttentionDisposition::Deliver,
+                veto_not_evaluated,
             };
         }
 
@@ -388,6 +411,8 @@ impl AttentionLayer {
                     matches,
                     space_id: None,
                     fallback: false,
+                    disposition: AttentionDisposition::Deliver,
+                    veto_not_evaluated,
                 };
             }
             return AttentionResult {
@@ -395,6 +420,8 @@ impl AttentionLayer {
                 matches,
                 space_id: None,
                 fallback: false,
+                disposition: AttentionDisposition::Filtered,
+                veto_not_evaluated,
             };
         };
 
@@ -444,6 +471,12 @@ impl AttentionLayer {
             matches,
             space_id: Some(vector_space_id),
             fallback: false,
+            disposition: if any_above_threshold {
+                AttentionDisposition::Deliver
+            } else {
+                AttentionDisposition::Filtered
+            },
+            veto_not_evaluated: false,
         }
     }
 
@@ -1094,6 +1127,7 @@ mod tests {
             .await;
 
         assert!(!result.deliver);
+        assert_eq!(result.disposition, AttentionDisposition::Vetoed);
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].receptor_id, "spam-veto");
         assert_eq!(result.matches[0].class, ReceptorClass::Veto);
@@ -1127,9 +1161,42 @@ mod tests {
             .await;
 
         assert!(result.deliver);
+        assert_eq!(result.disposition, AttentionDisposition::Deliver);
         assert!(result.fallback);
         assert_eq!(result.matches.len(), 1);
         assert!(!result.matches[0].above_threshold);
+    }
+
+    #[tokio::test]
+    async fn missing_supplied_embedding_marks_veto_not_evaluated() {
+        let layer = AttentionLayer {
+            receptors: vec![
+                ComputedReceptor {
+                    receptor_id: "spam-veto".to_string(),
+                    class: ReceptorClass::Veto,
+                    threshold: 0.8,
+                    vector: Some(vec![1.0, 0.0]),
+                    space_id: Some("test:model:2:v1".to_string()),
+                },
+                ComputedReceptor {
+                    receptor_id: "apple-platforms".to_string(),
+                    class: ReceptorClass::Broad,
+                    threshold: 0.5,
+                    vector: Some(vec![1.0, 0.0]),
+                    space_id: Some("test:model:2:v1".to_string()),
+                },
+            ],
+            plugin: None,
+            space_id: Some("test:model:2:v1".to_string()),
+            degraded: false,
+            veto_enforcement_unavailable: false,
+        };
+
+        let result = layer.evaluate("plaintext only", &[]).await;
+
+        assert!(!result.deliver);
+        assert_eq!(result.disposition, AttentionDisposition::Filtered);
+        assert!(result.veto_not_evaluated);
     }
 
     #[tokio::test]
@@ -1300,6 +1367,8 @@ mod tests {
             ],
             space_id: Some("test:model:768:v1".to_string()),
             fallback: false,
+            disposition: AttentionDisposition::Deliver,
+            veto_not_evaluated: false,
         };
 
         let annotation = format_attention_annotation(&result).unwrap();
