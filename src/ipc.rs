@@ -152,6 +152,7 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::attention::{MessageEmbedding, OutboundEmbeddingRequest, validate_generated_spaces};
+use crate::build_info::{BuildInfo, current, current_exe_sha256};
 use crate::config::canonicalize_base_url;
 use crate::setup::{LiveSetupState, SetupRequest, perform_setup};
 use crate::supervisor::{DaemonStatus, ServerSendResultEnvelope};
@@ -190,6 +191,7 @@ struct HealthBody {
     ok: bool,
     gateway_state: String,
     wake_session_key: String,
+    build_info: BuildInfo,
     servers: Vec<crate::supervisor::ServerHealth>,
 }
 
@@ -409,6 +411,7 @@ async fn handle_request(
                     ok: snapshot.is_healthy(),
                     gateway_state: snapshot.gateway_state.clone(),
                     wake_session_key: snapshot.wake_session_key.clone(),
+                    build_info: current(current_exe_sha256()),
                     servers: snapshot.servers_snapshot(),
                 },
             )

@@ -1,4 +1,5 @@
 mod attention;
+mod build_info;
 mod config;
 mod gateway;
 mod ipc;
@@ -30,8 +31,10 @@ use clap::{Args, Parser, Subcommand};
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "subspace-daemon")]
+#[command(name = "subspace-daemon", disable_version_flag = true)]
 struct Cli {
+    #[arg(long, short = 'V', global = true)]
+    version: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -49,6 +52,7 @@ enum Command {
     Send(SendArgs),
     Setup(SetupArgs),
     EvalAttention(EvalAttentionArgs),
+    Version,
 }
 
 #[derive(Args, Debug)]
@@ -107,11 +111,15 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    if cli.version {
+        return version();
+    }
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Send(args)) => send(args).await,
         Some(Command::Setup(args)) => setup(args).await,
         Some(Command::EvalAttention(args)) => eval_attention(args).await,
+        Some(Command::Version) => version(),
         None => {
             serve(ServeArgs {
                 config: default_config_path(),
@@ -119,6 +127,12 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+fn version() -> Result<()> {
+    let info = build_info::current(build_info::current_exe_sha256());
+    println!("{}", serde_json::to_string_pretty(&info)?);
+    Ok(())
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
