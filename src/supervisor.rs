@@ -19,7 +19,7 @@ use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
 use crate::setup::{LiveSetupState, SharedServerHandles, SharedServerTasks, spawn_server_manager};
 use crate::state_lock::StateLock;
-use crate::storage::DeliveryStore;
+use crate::storage::{DeliveryStore, SinkSnapshot};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerHealth {
@@ -478,12 +478,47 @@ async fn process_wake_queue(
 
         for sink in wake_sinks {
             let rendered = render_inbound_wake(&item, &attention_result);
-            let effective_session_key = item
-                .wake_session_key_override
+            let effective_session_key = sink
+                .destination
                 .as_deref()
+                .or(item.wake_session_key_override.as_deref())
                 .unwrap_or(&wake_session_key);
+            let delivery_ticket = if let Some(store) = delivery_store.as_ref() {
+                let snapshot = SinkSnapshot {
+                    sink_key: &sink.key,
+                    sink_kind: SinkKind::AgentSessionWake,
+                    destination: effective_session_key,
+                    config_json: serde_json::json!({
+                        "session_key": effective_session_key,
+                    })
+                    .to_string(),
+                };
+                Some(store.queue_wake_sink_delivery(&item, &attention_result, &snapshot)?)
+            } else {
+                None
+            };
+            if delivery_ticket
+                .as_ref()
+                .is_some_and(|ticket| ticket.already_delivered)
+            {
+                info!(
+                    component = "wake_router",
+                    event = "wake_already_delivered",
+                    message_id = %item.message_id,
+                    server = %item.server,
+                    session_key = %effective_session_key,
+                    sink_key = %sink.key,
+                    "wake already recorded as delivered; skipping duplicate send"
+                );
+                continue;
+            }
             let mut backoff_ms = retry.base_ms;
             loop {
+                if let Some(store) = delivery_store.as_ref() {
+                    if let Some(ticket) = delivery_ticket.as_ref() {
+                        store.mark_delivery_attempted(ticket.delivery_id)?;
+                    }
+                }
                 let send_future = gateway.send_chat(
                     effective_session_key.to_string(),
                     rendered.clone(),
@@ -505,12 +540,9 @@ async fn process_wake_queue(
                 match result {
                     Ok(()) => {
                         if let Some(store) = delivery_store.as_ref() {
-                            store.record_wake_sink_delivery(
-                                &item,
-                                &attention_result,
-                                &sink.key,
-                                effective_session_key,
-                            )?;
+                            if let Some(ticket) = delivery_ticket.as_ref() {
+                                store.mark_delivery_delivered(ticket.delivery_id)?;
+                            }
                         }
                         info!(
                             component = "wake_router",
@@ -527,6 +559,11 @@ async fn process_wake_queue(
                         break;
                     }
                     Err(err) => {
+                        if let Some(store) = delivery_store.as_ref() {
+                            if let Some(ticket) = delivery_ticket.as_ref() {
+                                store.mark_delivery_failed(ticket.delivery_id, &err.to_string())?;
+                            }
+                        }
                         warn!(component = "wake_router", event = "wake_failed", message_id = %item.message_id, server = %item.server, sink_key = %sink.key, error = %err, "wake failed; retrying");
                         let delay = Duration::from_millis(jitter(backoff_ms, retry.jitter_ratio));
                         if let Some(deadline) = shutdown_deadline {

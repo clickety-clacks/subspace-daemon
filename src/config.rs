@@ -87,6 +87,7 @@ pub struct SinkConfig {
     pub key: String,
     pub kind: SinkKind,
     pub enabled: bool,
+    pub destination: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +231,8 @@ pub struct StoredSinkConfig {
     pub key: Option<String>,
     pub kind: String,
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub destination: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -435,6 +438,7 @@ fn normalize_sinks(stored: &[StoredSinkConfig]) -> Result<Vec<SinkConfig>> {
                 key: Some(sink.key),
                 kind: sink.kind.as_str().to_string(),
                 enabled: Some(sink.enabled),
+                destination: sink.destination,
             })
             .collect::<Vec<_>>()
     } else {
@@ -460,6 +464,10 @@ fn normalize_sinks(stored: &[StoredSinkConfig]) -> Result<Vec<SinkConfig>> {
             key,
             kind,
             enabled: sink.enabled.unwrap_or(true),
+            destination: sink
+                .destination
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         });
     }
     Ok(sinks)
@@ -471,11 +479,13 @@ fn default_sinks() -> Vec<SinkConfig> {
             key: SinkKind::Db.default_key().to_string(),
             kind: SinkKind::Db,
             enabled: true,
+            destination: None,
         },
         SinkConfig {
             key: SinkKind::AgentSessionWake.default_key().to_string(),
             kind: SinkKind::AgentSessionWake,
             enabled: true,
+            destination: None,
         },
     ]
 }
@@ -1083,6 +1093,26 @@ mod tests {
         assert!(!config.sinks[0].enabled);
         assert_eq!(config.sinks[1].key, "wake-primary");
         assert_eq!(config.sinks[1].kind, SinkKind::AgentSessionWake);
+    }
+
+    #[test]
+    fn sink_destination_override_loads() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "sinks": [
+                { "key": "wake-a", "kind": "agent_session_wake", "destination": "agent:a:main" },
+                { "key": "wake-b", "kind": "agent_session_wake", "destination": "agent:b:main" }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.sinks[0].destination.as_deref(), Some("agent:a:main"));
+        assert_eq!(config.sinks[1].destination.as_deref(), Some("agent:b:main"));
     }
 
     #[test]
