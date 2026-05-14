@@ -18,6 +18,7 @@ pub struct Config {
     pub replay: ReplayConfig,
     pub logging: LoggingConfig,
     pub retry: RetryConfig,
+    pub storage: StorageConfig,
     pub paths: AppPaths,
 }
 
@@ -74,6 +75,13 @@ pub struct RetryConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub database_path: PathBuf,
+    pub artifact_root: PathBuf,
+    pub auto_migrate: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct StormGuardConfig {
     pub failure_window_ms: u64,
     pub consecutive_failure_threshold: u32,
@@ -124,6 +132,8 @@ pub struct StoredConfig {
     pub logging: StoredLoggingConfig,
     #[serde(default)]
     pub retry: StoredRetryConfig,
+    #[serde(default)]
+    pub storage: StoredStorageConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -193,6 +203,13 @@ pub struct StoredStormGuardConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StoredStorageConfig {
+    pub database_path: Option<String>,
+    pub artifact_root: Option<String>,
+    pub auto_migrate: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StoredAttentionConfig {
     #[serde(default)]
     pub local_pack_paths: Vec<String>,
@@ -229,6 +246,7 @@ impl Default for StoredConfig {
             ipc: StoredIpcConfig::default(),
             logging: StoredLoggingConfig::default(),
             retry: StoredRetryConfig::default(),
+            storage: StoredStorageConfig::default(),
         }
     }
 }
@@ -366,6 +384,19 @@ impl Config {
                         .unwrap_or(3_600_000),
                 },
             },
+            storage: StorageConfig {
+                database_path: stored
+                    .storage
+                    .database_path
+                    .map(|value| expand_tilde(PathBuf::from(value)))
+                    .unwrap_or_else(default_database_path),
+                artifact_root: stored
+                    .storage
+                    .artifact_root
+                    .map(|value| expand_tilde(PathBuf::from(value)))
+                    .unwrap_or_else(default_artifact_root),
+                auto_migrate: stored.storage.auto_migrate.unwrap_or(true),
+            },
             paths,
         })
     }
@@ -433,6 +464,16 @@ struct LocalGatewayAuth {
 
 pub fn default_config_path() -> PathBuf {
     expand_tilde(PathBuf::from("~/.openclaw/subspace-daemon/config.json"))
+}
+
+pub fn default_database_path() -> PathBuf {
+    expand_tilde(PathBuf::from(
+        "~/.openclaw/subspace-daemon/data/daemon.sqlite3",
+    ))
+}
+
+pub fn default_artifact_root() -> PathBuf {
+    expand_tilde(PathBuf::from("~/.openclaw/subspace-daemon/artifacts"))
 }
 
 pub fn expand_tilde(path: PathBuf) -> PathBuf {
@@ -730,6 +771,9 @@ mod tests {
         assert_eq!(config.servers[0].identity.as_deref(), Some("heimdal"));
         assert!(config.servers[0].runtime_path.ends_with("runtime.json"));
         assert_eq!(config.paths.config_path, config_path);
+        assert_eq!(config.storage.database_path, default_database_path());
+        assert_eq!(config.storage.artifact_root, default_artifact_root());
+        assert!(config.storage.auto_migrate);
     }
 
     #[test]
@@ -876,6 +920,34 @@ mod tests {
                 .effective_local_pack_paths(&config.attention.local_pack_paths)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn loads_storage_overrides_with_tilde_expansion() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "storage": {
+                "database_path": "~/.subspace-db/custom.sqlite3",
+                "artifact_root": "~/.subspace-db/artifacts",
+                "auto_migrate": false
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(
+            config.storage.database_path,
+            expand_tilde(PathBuf::from("~/.subspace-db/custom.sqlite3"))
+        );
+        assert_eq!(
+            config.storage.artifact_root,
+            expand_tilde(PathBuf::from("~/.subspace-db/artifacts"))
+        );
+        assert!(!config.storage.auto_migrate);
     }
 
     #[test]
