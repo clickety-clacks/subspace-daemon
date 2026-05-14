@@ -112,10 +112,15 @@ pub struct HelloOk {
     #[serde(rename = "type")]
     pub hello_type: String,
     pub protocol: u64,
-    pub server: Value,
-    pub features: Value,
-    pub snapshot: Value,
+    #[serde(default)]
+    pub server: Option<Value>,
+    #[serde(default)]
+    pub features: Option<Value>,
+    #[serde(default)]
+    pub snapshot: Option<Value>,
+    #[serde(default)]
     pub auth: Option<HelloAuth>,
+    #[serde(default)]
     pub policy: HelloPolicy,
 }
 
@@ -128,9 +133,9 @@ pub struct HelloAuth {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HelloPolicy {
-    #[serde(rename = "tickIntervalMs")]
+    #[serde(default, rename = "tickIntervalMs")]
     pub tick_interval_ms: u64,
 }
 
@@ -159,4 +164,25 @@ pub fn build_device_auth_payload_v3(
         platform.trim().to_lowercase(),
         device_family.unwrap_or("").trim().to_lowercase(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HelloOk;
+
+    #[test]
+    fn parses_minimal_hello_ok_payload() {
+        let hello: HelloOk = serde_json::from_value(serde_json::json!({
+            "type": "hello-ok",
+            "protocol": 3,
+            "policy": { "tickIntervalMs": 15000 }
+        }))
+        .unwrap();
+        assert_eq!(hello.hello_type, "hello-ok");
+        assert_eq!(hello.protocol, 3);
+        assert_eq!(hello.policy.tick_interval_ms, 15000);
+        assert!(hello.server.is_none());
+        assert!(hello.features.is_none());
+        assert!(hello.snapshot.is_none());
+    }
 }
