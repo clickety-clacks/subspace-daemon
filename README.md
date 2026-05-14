@@ -33,7 +33,7 @@ The default local paths are:
 - Logs: `~/.openclaw/subspace-daemon/logs/`
 - Named identities: `~/.openclaw/subspace-daemon/identities/`
 - DB: `~/.openclaw/subspace-daemon/data/daemon.sqlite3`
-- Artifacts: `~/.openclaw/subspace-daemon/artifacts/`
+- Artifacts: `~/.openclaw/subspace-daemon/artifacts/` (reserved artifact root; metadata/byte writes are not implemented yet)
 - LaunchAgent plist: `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist`
 - Installed binaries: `~/.local/bin/subspace-daemon` and `~/.local/bin/subspace-send`
 

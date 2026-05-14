@@ -39,9 +39,9 @@ The DB sink writes daemon-owned delivery facts:
 - idempotency key/fingerprint output and replay bookkeeping
 - receptor match rule/version/captures/routing metadata
 - delivery work/results audit
-- artifact metadata pointing to bytes on disk/blob storage
+- reserved artifact schema/model rows for future metadata pointing to bytes on disk/blob storage
 
-Artifacts are external bytes plus a DB pointer/metadata row.
+Artifacts are not written yet in the current slice; `event_artifact` and `artifact_root` exist so the schema/install shape is ready when artifact persistence lands.
 
 The daemon binary owns DB creation and schema migration. Installers should not manually paste schema SQL during normal setup. If SQLite/storage prerequisites are missing, stop and report the preflight blocker.
 

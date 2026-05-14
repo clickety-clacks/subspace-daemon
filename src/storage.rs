@@ -5,9 +5,19 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
-use crate::attention::{AttentionResult, ReceptorMatch};
-use crate::config::{SinkKind, StorageConfig};
+use crate::attention::{AttentionDisposition, AttentionResult, ReceptorMatch};
+use crate::config::{SinkConfig, SinkKind, StorageConfig};
 use crate::supervisor::WakeEnvelope;
+
+const REQUIRED_TABLES: &[&str] = &[
+    "ingress_source",
+    "daemon_event",
+    "event_idempotency",
+    "receptor_match",
+    "sink_target",
+    "sink_delivery",
+    "event_artifact",
+];
 
 #[derive(Debug, Clone)]
 pub struct DeliveryStore {
@@ -37,6 +47,19 @@ pub struct SinkSnapshot<'a> {
     pub config_json: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RoutingSnapshot<'a> {
+    pub candidate_sinks: &'a [SinkRoutingEntry],
+    pub selected_sinks: &'a [SinkRoutingEntry],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkRoutingEntry {
+    pub sink_key: String,
+    pub sink_kind: SinkKind,
+    pub destination: String,
+}
+
 impl DeliveryStore {
     pub fn new(config: &StorageConfig) -> Self {
         Self {
@@ -53,22 +76,33 @@ impl DeliveryStore {
         })
     }
 
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
     pub fn record_db_sink_delivery(
         &self,
         envelope: &WakeEnvelope,
         attention: &AttentionResult,
+        sink: &SinkConfig,
+        routing: &RoutingSnapshot<'_>,
     ) -> Result<EventRecord> {
         self.with_connection(|conn| {
             ensure_schema(conn, self.auto_migrate)?;
-            let event = upsert_canonical_event(conn, envelope, attention)?;
-            let db_destination = self.database_path.to_string_lossy().to_string();
+            let event = upsert_canonical_event(conn, envelope, attention, routing)?;
+            let db_destination = sink
+                .destination
+                .clone()
+                .unwrap_or_else(|| self.database_path.to_string_lossy().to_string());
             let snapshot = SinkSnapshot {
-                sink_key: "db",
+                sink_key: &sink.key,
                 sink_kind: SinkKind::Db,
                 destination: &db_destination,
                 config_json: json!({
+                    "sink_key": sink.key,
                     "database_path": self.database_path,
                     "artifact_root": self.artifact_root,
+                    "configured_destination": sink.destination,
                 })
                 .to_string(),
             };
@@ -85,10 +119,11 @@ impl DeliveryStore {
         envelope: &WakeEnvelope,
         attention: &AttentionResult,
         snapshot: &SinkSnapshot<'_>,
+        routing: &RoutingSnapshot<'_>,
     ) -> Result<DeliveryTicket> {
         self.with_connection(|conn| {
             ensure_schema(conn, self.auto_migrate)?;
-            let event = upsert_canonical_event(conn, envelope, attention)?;
+            let event = upsert_canonical_event(conn, envelope, attention, routing)?;
             let sink_target_id = upsert_sink_target(conn, snapshot)?;
             let delivery_id =
                 upsert_sink_delivery(conn, event.daemon_event_id, sink_target_id, snapshot)?;
@@ -158,6 +193,33 @@ impl DeliveryStore {
         })
     }
 
+    pub fn reconcile_sink_targets(
+        &self,
+        sinks: &[SinkConfig],
+        wake_session_key: &str,
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            ensure_schema(conn, self.auto_migrate)?;
+            for sink in sinks {
+                let destination = sink_destination(self, sink, wake_session_key);
+                let snapshot = SinkSnapshot {
+                    sink_key: &sink.key,
+                    sink_kind: sink.kind.clone(),
+                    destination: &destination,
+                    config_json: sink_config_json(self, sink, &destination),
+                };
+                let sink_target_id = upsert_sink_target(conn, &snapshot)?;
+                if sink.enabled {
+                    clear_sink_target_disabled(conn, sink_target_id)?;
+                } else {
+                    soft_disable_sink_target(conn, sink_target_id, "sink disabled in config")?;
+                }
+            }
+            soft_disable_missing_sink_targets(conn, sinks)?;
+            Ok(())
+        })
+    }
+
     fn with_connection<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         if let Some(parent) = self.database_path.parent() {
             fs::create_dir_all(parent)?;
@@ -171,23 +233,20 @@ impl DeliveryStore {
 }
 
 fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
-    let already_initialized: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='daemon_event'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if already_initialized.is_some() {
-        return Ok(());
-    }
     if legacy_schema_present(conn)? {
         bail!(
             "legacy accepted_message schema present; manual migration required before continuing"
         );
     }
+    let missing = missing_required_tables(conn)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
     if !auto_migrate {
-        bail!("database schema missing and storage.auto_migrate is false");
+        bail!(
+            "database schema incomplete; missing tables: {} and storage.auto_migrate is false",
+            missing.join(", ")
+        );
     }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS ingress_source (
@@ -277,7 +336,31 @@ fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_sink_delivery_event ON sink_delivery(daemon_event_id);
         CREATE INDEX IF NOT EXISTS idx_sink_delivery_status ON sink_delivery(status);",
     )?;
+    let missing_after_migration = missing_required_tables(conn)?;
+    if !missing_after_migration.is_empty() {
+        bail!(
+            "database schema incomplete after migration; missing tables: {}",
+            missing_after_migration.join(", ")
+        );
+    }
     Ok(())
+}
+
+fn missing_required_tables(conn: &Connection) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for table in REQUIRED_TABLES {
+        let present: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if present.is_none() {
+            missing.push((*table).to_string());
+        }
+    }
+    Ok(missing)
 }
 
 fn legacy_schema_present(conn: &Connection) -> Result<bool> {
@@ -295,11 +378,12 @@ fn upsert_canonical_event(
     conn: &Connection,
     envelope: &WakeEnvelope,
     attention: &AttentionResult,
+    routing: &RoutingSnapshot<'_>,
 ) -> Result<EventRecord> {
     let ingress_source_id = upsert_ingress_source(conn, &envelope.server, &envelope.server_key)?;
     let idempotency_key = compute_event_idempotency_key(envelope);
     if let Some(existing_id) = lookup_existing_event(conn, ingress_source_id, &idempotency_key)? {
-        upsert_receptor_matches(conn, existing_id, attention)?;
+        upsert_receptor_matches(conn, existing_id, attention, routing)?;
         return Ok(EventRecord {
             daemon_event_id: existing_id,
             inserted: false,
@@ -355,7 +439,7 @@ fn upsert_canonical_event(
          VALUES (?1, 'subspace_message', ?2, ?3)",
         params![ingress_source_id, idempotency_key, daemon_event_id],
     )?;
-    upsert_receptor_matches(conn, daemon_event_id, attention)?;
+    upsert_receptor_matches(conn, daemon_event_id, attention, routing)?;
     Ok(EventRecord {
         daemon_event_id,
         inserted: true,
@@ -396,9 +480,10 @@ fn upsert_receptor_matches(
     conn: &Connection,
     daemon_event_id: i64,
     attention: &AttentionResult,
+    routing: &RoutingSnapshot<'_>,
 ) -> Result<()> {
     for matched in &attention.matches {
-        let routing_json = receptor_routing_json(matched).to_string();
+        let routing_json = receptor_routing_json(matched, routing).to_string();
         conn.execute(
             "INSERT INTO receptor_match (
                 daemon_event_id,
@@ -426,6 +511,56 @@ fn upsert_receptor_matches(
             ],
         )?;
     }
+    Ok(())
+}
+
+fn soft_disable_missing_sink_targets(conn: &Connection, sinks: &[SinkConfig]) -> Result<()> {
+    let configured_keys: Vec<&str> = sinks.iter().map(|sink| sink.key.as_str()).collect();
+    if configured_keys.is_empty() {
+        conn.execute(
+            "UPDATE sink_target
+             SET disabled_at = COALESCE(disabled_at, CURRENT_TIMESTAMP),
+                 disabled_reason = COALESCE(disabled_reason, 'sink removed from config'),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE disabled_at IS NULL",
+            [],
+        )?;
+        return Ok(());
+    }
+
+    let placeholders = vec!["?"; configured_keys.len()].join(", ");
+    let sql = format!(
+        "UPDATE sink_target
+         SET disabled_at = COALESCE(disabled_at, CURRENT_TIMESTAMP),
+             disabled_reason = COALESCE(disabled_reason, 'sink removed from config'),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE sink_key NOT IN ({placeholders}) AND disabled_at IS NULL"
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(configured_keys))?;
+    Ok(())
+}
+
+fn clear_sink_target_disabled(conn: &Connection, sink_target_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE sink_target
+         SET disabled_at = NULL,
+             disabled_reason = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        params![sink_target_id],
+    )?;
+    Ok(())
+}
+
+fn soft_disable_sink_target(conn: &Connection, sink_target_id: i64, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sink_target
+         SET disabled_at = COALESCE(disabled_at, CURRENT_TIMESTAMP),
+             disabled_reason = ?2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        params![sink_target_id, reason],
+    )?;
     Ok(())
 }
 
@@ -526,14 +661,56 @@ fn compute_event_idempotency_key(envelope: &WakeEnvelope) -> String {
     format!("{}:{}", envelope.server_key, envelope.message_id)
 }
 
-fn receptor_routing_json(matched: &ReceptorMatch) -> serde_json::Value {
+fn receptor_routing_json(
+    matched: &ReceptorMatch,
+    routing: &RoutingSnapshot<'_>,
+) -> serde_json::Value {
     json!({
         "decision": if matched.above_threshold { "accepted" } else { "candidate" },
-        "candidate_sinks": [],
-        "selected_sinks": [],
+        "candidate_sinks": routing_entries_json(routing.candidate_sinks),
+        "selected_sinks": routing_entries_json(routing.selected_sinks),
         "score": matched.score,
         "threshold": matched.threshold,
     })
+}
+
+fn routing_entries_json(entries: &[SinkRoutingEntry]) -> Vec<serde_json::Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "sink_key": entry.sink_key,
+                "sink_kind": entry.sink_kind.as_str(),
+                "destination": entry.destination,
+            })
+        })
+        .collect()
+}
+
+fn sink_destination(store: &DeliveryStore, sink: &SinkConfig, wake_session_key: &str) -> String {
+    sink.destination.clone().unwrap_or_else(|| match sink.kind {
+        SinkKind::Db => store.database_path.to_string_lossy().to_string(),
+        SinkKind::AgentSessionWake => wake_session_key.to_string(),
+    })
+}
+
+fn sink_config_json(store: &DeliveryStore, sink: &SinkConfig, destination: &str) -> String {
+    match sink.kind {
+        SinkKind::Db => json!({
+            "sink_key": sink.key,
+            "database_path": store.database_path,
+            "artifact_root": store.artifact_root,
+            "configured_destination": sink.destination,
+            "effective_destination": destination,
+        })
+        .to_string(),
+        SinkKind::AgentSessionWake => json!({
+            "sink_key": sink.key,
+            "session_key": destination,
+            "configured_destination": sink.destination,
+        })
+        .to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +734,39 @@ mod tests {
             }],
             space_id: Some("space:test".to_string()),
             fallback: false,
+            disposition: AttentionDisposition::Deliver,
+            veto_not_evaluated: false,
+        }
+    }
+
+    fn test_routing() -> Vec<SinkRoutingEntry> {
+        vec![
+            SinkRoutingEntry {
+                sink_key: "db-main".to_string(),
+                sink_kind: SinkKind::Db,
+                destination: "/tmp/daemon.sqlite3".to_string(),
+            },
+            SinkRoutingEntry {
+                sink_key: "wake-primary".to_string(),
+                sink_kind: SinkKind::AgentSessionWake,
+                destination: "agent:test:main".to_string(),
+            },
+        ]
+    }
+
+    fn db_sink_config(destination: Option<&str>) -> SinkConfig {
+        SinkConfig {
+            key: "db-main".to_string(),
+            kind: SinkKind::Db,
+            enabled: true,
+            destination: destination.map(str::to_string),
+        }
+    }
+
+    fn routing_snapshot(entries: &[SinkRoutingEntry]) -> RoutingSnapshot<'_> {
+        RoutingSnapshot {
+            candidate_sinks: entries,
+            selected_sinks: entries,
         }
     }
 
@@ -590,6 +800,7 @@ mod tests {
 
         let err = store.ensure_ready().unwrap_err().to_string();
         assert!(err.contains("storage.auto_migrate is false"));
+        assert!(err.contains("database schema incomplete"));
     }
 
     #[test]
@@ -617,12 +828,14 @@ mod tests {
         });
         let envelope = test_envelope(dir.path());
         let attention = test_attention();
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
 
         let first = store
-            .record_db_sink_delivery(&envelope, &attention)
+            .record_db_sink_delivery(&envelope, &attention, &db_sink_config(None), &routing)
             .unwrap();
         let second = store
-            .record_db_sink_delivery(&envelope, &attention)
+            .record_db_sink_delivery(&envelope, &attention, &db_sink_config(None), &routing)
             .unwrap();
         let counts = store.counts().unwrap();
 
@@ -647,14 +860,16 @@ mod tests {
             destination: "agent:test:main",
             config_json: json!({"session_key": "agent:test:main"}).to_string(),
         };
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
 
         let first = store
-            .queue_wake_sink_delivery(&envelope, &attention, &snapshot)
+            .queue_wake_sink_delivery(&envelope, &attention, &snapshot, &routing)
             .unwrap();
         store.mark_delivery_attempted(first.delivery_id).unwrap();
         store.mark_delivery_delivered(first.delivery_id).unwrap();
         let second = store
-            .queue_wake_sink_delivery(&envelope, &attention, &snapshot)
+            .queue_wake_sink_delivery(&envelope, &attention, &snapshot, &routing)
             .unwrap();
         let counts = store.counts().unwrap();
 
@@ -679,16 +894,18 @@ mod tests {
             destination: "agent:a:main",
             config_json: json!({"session_key": "agent:a:main"}).to_string(),
         };
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
 
         let first = store
-            .queue_wake_sink_delivery(&envelope, &attention, &snapshot)
+            .queue_wake_sink_delivery(&envelope, &attention, &snapshot, &routing)
             .unwrap();
         store.mark_delivery_attempted(first.delivery_id).unwrap();
         store
             .mark_delivery_failed(first.delivery_id, "network blew up")
             .unwrap();
         let second = store
-            .queue_wake_sink_delivery(&envelope, &attention, &snapshot)
+            .queue_wake_sink_delivery(&envelope, &attention, &snapshot, &routing)
             .unwrap();
         assert_eq!(first.delivery_id, second.delivery_id);
         assert!(!second.already_delivered);
@@ -727,11 +944,14 @@ mod tests {
             config_json: json!({"session_key": "agent:b:main"}).to_string(),
         };
 
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
+
         store
-            .queue_wake_sink_delivery(&envelope, &attention, &sink_a)
+            .queue_wake_sink_delivery(&envelope, &attention, &sink_a, &routing)
             .unwrap();
         store
-            .queue_wake_sink_delivery(&envelope, &attention, &sink_b)
+            .queue_wake_sink_delivery(&envelope, &attention, &sink_b, &routing)
             .unwrap();
 
         let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
@@ -746,6 +966,248 @@ mod tests {
             destinations,
             vec!["agent:a:main".to_string(), "agent:b:main".to_string()]
         );
+    }
+
+    #[test]
+    fn receptor_match_routing_json_captures_candidate_and_selected_sinks() {
+        let dir = tempdir().unwrap();
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: dir.path().join("daemon.sqlite3"),
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+        let envelope = test_envelope(dir.path());
+        let attention = test_attention();
+        let routing_entries = test_routing();
+
+        store
+            .record_db_sink_delivery(
+                &envelope,
+                &attention,
+                &db_sink_config(None),
+                &routing_snapshot(&routing_entries),
+            )
+            .unwrap();
+
+        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
+        let routing_json: String = conn
+            .query_row("SELECT routing_json FROM receptor_match", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let routing: serde_json::Value = serde_json::from_str(&routing_json).unwrap();
+        assert_eq!(routing["candidate_sinks"][0]["sink_key"], "db-main");
+        assert_eq!(routing["candidate_sinks"][1]["sink_key"], "wake-primary");
+        assert_eq!(
+            routing["selected_sinks"][0]["destination"],
+            "/tmp/daemon.sqlite3"
+        );
+        assert_eq!(
+            routing["selected_sinks"][1]["destination"],
+            "agent:test:main"
+        );
+    }
+
+    #[test]
+    fn db_sink_delivery_snapshots_configured_sink_identity() {
+        let dir = tempdir().unwrap();
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: dir.path().join("daemon.sqlite3"),
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+        let envelope = test_envelope(dir.path());
+        let attention = test_attention();
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
+
+        store
+            .record_db_sink_delivery(
+                &envelope,
+                &attention,
+                &db_sink_config(Some("sqlite://custom-db")),
+                &routing,
+            )
+            .unwrap();
+
+        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT sink_key_snapshot, destination_snapshot, config_json_snapshot FROM sink_delivery",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "db-main");
+        assert_eq!(row.1, "sqlite://custom-db");
+        let config: serde_json::Value = serde_json::from_str(&row.2).unwrap();
+        assert_eq!(config["sink_key"], "db-main");
+        assert_eq!(config["configured_destination"], "sqlite://custom-db");
+    }
+
+    #[test]
+    fn reconcile_sink_targets_soft_disables_removed_and_disabled_sinks() {
+        let dir = tempdir().unwrap();
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: dir.path().join("daemon.sqlite3"),
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+
+        let original = vec![
+            SinkConfig {
+                key: "db-main".to_string(),
+                kind: SinkKind::Db,
+                enabled: true,
+                destination: None,
+            },
+            SinkConfig {
+                key: "wake-a".to_string(),
+                kind: SinkKind::AgentSessionWake,
+                enabled: true,
+                destination: Some("agent:a:main".to_string()),
+            },
+        ];
+        store
+            .reconcile_sink_targets(&original, "agent:default:main")
+            .unwrap();
+
+        let updated = vec![SinkConfig {
+            key: "db-main".to_string(),
+            kind: SinkKind::Db,
+            enabled: false,
+            destination: None,
+        }];
+        store
+            .reconcile_sink_targets(&updated, "agent:default:main")
+            .unwrap();
+
+        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
+        let rows: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT sink_key, disabled_at, disabled_reason FROM sink_target ORDER BY sink_key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].1.is_some());
+        assert_eq!(rows[0].2.as_deref(), Some("sink disabled in config"));
+        assert!(rows[1].1.is_some());
+        assert_eq!(rows[1].2.as_deref(), Some("sink removed from config"));
+    }
+
+    #[test]
+    fn partial_schema_is_migrated_when_auto_migrate_is_enabled() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("daemon.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ingress_source (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server TEXT NOT NULL,
+                server_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE daemon_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ingress_source_id INTEGER NOT NULL REFERENCES ingress_source(id) ON DELETE RESTRICT,
+                message_id TEXT NOT NULL,
+                message_timestamp TEXT NOT NULL,
+                inbound_event TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                author_name TEXT NOT NULL,
+                text TEXT NOT NULL,
+                sender_embeddings_json TEXT,
+                attention_space_id TEXT,
+                attention_fallback INTEGER NOT NULL,
+                payload_json TEXT,
+                raw_body TEXT,
+                accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: db_path,
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+        store.ensure_ready().unwrap();
+
+        let counts = store.counts().unwrap();
+        assert_eq!(counts, (0, 0, 0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn partial_schema_is_rejected_when_auto_migrate_is_disabled() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("daemon.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ingress_source (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server TEXT NOT NULL,
+                server_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE daemon_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ingress_source_id INTEGER NOT NULL REFERENCES ingress_source(id) ON DELETE RESTRICT,
+                message_id TEXT NOT NULL,
+                message_timestamp TEXT NOT NULL,
+                inbound_event TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                author_name TEXT NOT NULL,
+                text TEXT NOT NULL,
+                sender_embeddings_json TEXT,
+                attention_space_id TEXT,
+                attention_fallback INTEGER NOT NULL,
+                payload_json TEXT,
+                raw_body TEXT,
+                accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: db_path,
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: false,
+        });
+
+        let err = store.ensure_ready().unwrap_err().to_string();
+        assert!(err.contains("database schema incomplete"));
+        assert!(err.contains("event_idempotency"));
+    }
+
+    #[test]
+    fn normal_delivery_does_not_claim_artifact_rows_exist() {
+        let dir = tempdir().unwrap();
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: dir.path().join("daemon.sqlite3"),
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+        let envelope = test_envelope(dir.path());
+        let attention = test_attention();
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
+
+        store
+            .record_db_sink_delivery(&envelope, &attention, &db_sink_config(None), &routing)
+            .unwrap();
+
+        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
+        let artifact_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM event_artifact", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(artifact_rows, 0);
     }
 
     #[test]

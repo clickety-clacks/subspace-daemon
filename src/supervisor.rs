@@ -19,7 +19,7 @@ use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
 use crate::setup::{LiveSetupState, SharedServerHandles, SharedServerTasks, spawn_server_manager};
 use crate::state_lock::StateLock;
-use crate::storage::{DeliveryStore, SinkSnapshot};
+use crate::storage::{DeliveryStore, RoutingSnapshot, SinkRoutingEntry, SinkSnapshot};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerHealth {
@@ -462,19 +462,51 @@ async fn process_wake_queue(
             continue;
         }
 
-        let db_enabled = sinks
-            .iter()
-            .any(|sink| sink.enabled && sink.kind == SinkKind::Db);
-        if db_enabled {
-            if let Some(store) = delivery_store.as_ref() {
-                store.record_db_sink_delivery(&item, &attention_result)?;
-            }
+        if let Some(store) = delivery_store.as_ref() {
+            store.reconcile_sink_targets(&sinks, &wake_session_key)?;
         }
 
+        let candidate_sinks = routing_entries_for_sinks(
+            &sinks,
+            item.wake_session_key_override.as_deref(),
+            &wake_session_key,
+            delivery_store.as_ref(),
+        );
+
+        let db_sink = sinks
+            .iter()
+            .find(|sink| sink.enabled && sink.kind == SinkKind::Db);
         let wake_sinks: Vec<&SinkConfig> = sinks
             .iter()
             .filter(|sink| sink.enabled && sink.kind == SinkKind::AgentSessionWake)
             .collect();
+        let mut selected_sinks = Vec::new();
+        if let Some(sink) = db_sink {
+            selected_sinks.push(routing_entry_for_sink(
+                sink,
+                item.wake_session_key_override.as_deref(),
+                &wake_session_key,
+                delivery_store.as_ref(),
+            ));
+        }
+        selected_sinks.extend(wake_sinks.iter().map(|sink| {
+            routing_entry_for_sink(
+                sink,
+                item.wake_session_key_override.as_deref(),
+                &wake_session_key,
+                delivery_store.as_ref(),
+            )
+        }));
+        let routing = RoutingSnapshot {
+            candidate_sinks: &candidate_sinks,
+            selected_sinks: &selected_sinks,
+        };
+
+        if let Some(sink) = db_sink {
+            if let Some(store) = delivery_store.as_ref() {
+                store.record_db_sink_delivery(&item, &attention_result, sink, &routing)?;
+            }
+        }
 
         for sink in wake_sinks {
             let rendered = render_inbound_wake(&item, &attention_result);
@@ -493,7 +525,12 @@ async fn process_wake_queue(
                     })
                     .to_string(),
                 };
-                Some(store.queue_wake_sink_delivery(&item, &attention_result, &snapshot)?)
+                Some(store.queue_wake_sink_delivery(
+                    &item,
+                    &attention_result,
+                    &snapshot,
+                    &routing,
+                )?)
             } else {
                 None
             };
@@ -585,6 +622,47 @@ async fn process_wake_queue(
         let mut runtime = item.runtime.lock().await;
         runtime.mark_processed(&item.message_id, &item.timestamp);
         runtime.flush()?;
+    }
+}
+
+fn routing_entries_for_sinks(
+    sinks: &[SinkConfig],
+    wake_session_key_override: Option<&str>,
+    default_wake_session_key: &str,
+    delivery_store: Option<&DeliveryStore>,
+) -> Vec<SinkRoutingEntry> {
+    sinks
+        .iter()
+        .filter(|sink| sink.enabled)
+        .map(|sink| {
+            routing_entry_for_sink(
+                sink,
+                wake_session_key_override,
+                default_wake_session_key,
+                delivery_store,
+            )
+        })
+        .collect()
+}
+
+fn routing_entry_for_sink(
+    sink: &SinkConfig,
+    wake_session_key_override: Option<&str>,
+    default_wake_session_key: &str,
+    delivery_store: Option<&DeliveryStore>,
+) -> SinkRoutingEntry {
+    let destination = sink.destination.clone().unwrap_or_else(|| match sink.kind {
+        SinkKind::Db => delivery_store
+            .map(|store| store.database_path().display().to_string())
+            .unwrap_or_else(|| "db".to_string()),
+        SinkKind::AgentSessionWake => wake_session_key_override
+            .unwrap_or(default_wake_session_key)
+            .to_string(),
+    });
+    SinkRoutingEntry {
+        sink_key: sink.key.clone(),
+        sink_kind: sink.kind.clone(),
+        destination,
     }
 }
 
