@@ -483,6 +483,7 @@ async fn connect_once(
                             server_key: server.server_key.clone(),
                             message_id: message_id.clone(),
                             timestamp,
+                            inbound_event: parsed.get("event").and_then(Value::as_str).unwrap_or("").to_string(),
                             author_id,
                             author_name: payload
                                 .get("agentName")

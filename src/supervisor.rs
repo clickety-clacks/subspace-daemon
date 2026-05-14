@@ -11,7 +11,7 @@ use crate::attention::{
     AttentionDisposition, AttentionLayer, AttentionResult, MessageEmbedding,
     format_attention_annotation,
 };
-use crate::config::{Config, RetryConfig};
+use crate::config::{Config, RetryConfig, SinkConfig, SinkKind};
 use crate::gateway::client::{GatewayClientHandle, start_gateway_client};
 use crate::ipc::{SendRouter, run_ipc_server};
 use crate::launchd::render_launchd_plist;
@@ -19,6 +19,7 @@ use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
 use crate::setup::{LiveSetupState, SharedServerHandles, SharedServerTasks, spawn_server_manager};
 use crate::state_lock::StateLock;
+use crate::storage::DeliveryStore;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerHealth {
@@ -192,6 +193,7 @@ pub struct WakeEnvelope {
     pub server_key: String,
     pub message_id: String,
     pub timestamp: String,
+    pub inbound_event: String,
     pub author_id: String,
     pub author_name: String,
     pub text: String,
@@ -219,6 +221,17 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
     }
 
     let status = Arc::new(RwLock::new(DaemonStatus::new(&config)));
+    let delivery_store = if config
+        .sinks
+        .iter()
+        .any(|sink| sink.enabled && sink.kind == SinkKind::Db)
+    {
+        let store = DeliveryStore::new(&config.storage);
+        store.ensure_ready()?;
+        Some(store)
+    } else {
+        None
+    };
     let (shutdown_tx, _) = broadcast::channel(4);
 
     let (gateway, gateway_task) =
@@ -253,6 +266,8 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
         gateway.clone(),
         config.routing.wake_session_key.clone(),
         config.retry.clone(),
+        config.sinks.clone(),
+        delivery_store,
         shutdown_tx.subscribe(),
     ));
     let ipc_task = tokio::spawn(run_ipc_server(
@@ -348,6 +363,8 @@ async fn process_wake_queue(
     gateway: GatewayClientHandle,
     wake_session_key: String,
     retry: RetryConfig,
+    sinks: Vec<SinkConfig>,
+    delivery_store: Option<DeliveryStore>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut shutting_down = false;
@@ -445,66 +462,92 @@ async fn process_wake_queue(
             continue;
         }
 
-        let rendered = render_inbound_wake(&item, &attention_result);
-        let effective_session_key = item
-            .wake_session_key_override
-            .as_deref()
-            .unwrap_or(&wake_session_key);
-        let mut backoff_ms = retry.base_ms;
-        loop {
-            let send_future = gateway.send_chat(
-                effective_session_key.to_string(),
-                rendered.clone(),
-                format!("{}:{}", item.server_key, item.message_id),
-            );
-            let result = if let Some(deadline) = shutdown_deadline {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Ok(());
-                }
-                match tokio::time::timeout(remaining, send_future).await {
-                    Ok(result) => result,
-                    Err(_) => return Ok(()),
-                }
-            } else {
-                send_future.await
-            };
+        let db_enabled = sinks
+            .iter()
+            .any(|sink| sink.enabled && sink.kind == SinkKind::Db);
+        if db_enabled {
+            if let Some(store) = delivery_store.as_ref() {
+                store.record_db_sink_delivery(&item, &attention_result)?;
+            }
+        }
 
-            match result {
-                Ok(()) => {
-                    let mut runtime = item.runtime.lock().await;
-                    runtime.mark_processed(&item.message_id, &item.timestamp);
-                    runtime.flush()?;
-                    info!(
-                        component = "wake_router",
-                        event = "wake_sent",
-                        message_id = %item.message_id,
-                        server = %item.server,
-                        session_key = %effective_session_key,
-                        receptor_matches = attention_result.matches.iter()
-                            .filter(|m| m.above_threshold)
-                            .count(),
-                        "wake sent"
-                    );
-                    break;
-                }
-                Err(err) => {
-                    warn!(component = "wake_router", event = "wake_failed", message_id = %item.message_id, server = %item.server, error = %err, "wake failed; retrying");
-                    let delay = Duration::from_millis(jitter(backoff_ms, retry.jitter_ratio));
-                    if let Some(deadline) = shutdown_deadline {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            return Ok(());
-                        }
-                        tokio::time::sleep(delay.min(remaining)).await;
-                    } else {
-                        tokio::time::sleep(delay).await;
+        let wake_sinks: Vec<&SinkConfig> = sinks
+            .iter()
+            .filter(|sink| sink.enabled && sink.kind == SinkKind::AgentSessionWake)
+            .collect();
+
+        for sink in wake_sinks {
+            let rendered = render_inbound_wake(&item, &attention_result);
+            let effective_session_key = item
+                .wake_session_key_override
+                .as_deref()
+                .unwrap_or(&wake_session_key);
+            let mut backoff_ms = retry.base_ms;
+            loop {
+                let send_future = gateway.send_chat(
+                    effective_session_key.to_string(),
+                    rendered.clone(),
+                    format!("{}:{}:{}", item.server_key, item.message_id, sink.key),
+                );
+                let result = if let Some(deadline) = shutdown_deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(());
                     }
-                    backoff_ms = (backoff_ms.saturating_mul(2)).min(retry.max_ms);
+                    match tokio::time::timeout(remaining, send_future).await {
+                        Ok(result) => result,
+                        Err(_) => return Ok(()),
+                    }
+                } else {
+                    send_future.await
+                };
+
+                match result {
+                    Ok(()) => {
+                        if let Some(store) = delivery_store.as_ref() {
+                            store.record_wake_sink_delivery(
+                                &item,
+                                &attention_result,
+                                &sink.key,
+                                effective_session_key,
+                            )?;
+                        }
+                        info!(
+                            component = "wake_router",
+                            event = "wake_sent",
+                            message_id = %item.message_id,
+                            server = %item.server,
+                            session_key = %effective_session_key,
+                            sink_key = %sink.key,
+                            receptor_matches = attention_result.matches.iter()
+                                .filter(|m| m.above_threshold)
+                                .count(),
+                            "wake sent"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(component = "wake_router", event = "wake_failed", message_id = %item.message_id, server = %item.server, sink_key = %sink.key, error = %err, "wake failed; retrying");
+                        let delay = Duration::from_millis(jitter(backoff_ms, retry.jitter_ratio));
+                        if let Some(deadline) = shutdown_deadline {
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            if remaining.is_zero() {
+                                return Ok(());
+                            }
+                            tokio::time::sleep(delay.min(remaining)).await;
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
+                        backoff_ms = (backoff_ms.saturating_mul(2)).min(retry.max_ms);
+                    }
                 }
             }
         }
+
+        let mut runtime = item.runtime.lock().await;
+        runtime.mark_processed(&item.message_id, &item.timestamp);
+        runtime.flush()?;
     }
 }
 

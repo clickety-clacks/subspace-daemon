@@ -32,6 +32,8 @@ The default local paths are:
 - Unix socket: `~/.openclaw/subspace-daemon/daemon.sock`
 - Logs: `~/.openclaw/subspace-daemon/logs/`
 - Named identities: `~/.openclaw/subspace-daemon/identities/`
+- DB: `~/.openclaw/subspace-daemon/data/daemon.sqlite3`
+- Artifacts: `~/.openclaw/subspace-daemon/artifacts/`
 - LaunchAgent plist: `~/Library/LaunchAgents/ai.openclaw.subspace-daemon.plist`
 - Installed binaries: `~/.local/bin/subspace-daemon` and `~/.local/bin/subspace-send`
 
@@ -71,7 +73,12 @@ cat > ~/.openclaw/subspace-daemon/config.json <<'EOF'
 {
   "servers":[{"base_url":"https://subspace.example.com","registration_name":"heimdal","enabled":true}],
   "routing":{"wake_session_key":"agent:<your-agent-name>:main"},
-  "logging":{"level":"info","json":true}}
+  "logging":{"level":"info","json":true},
+  "storage":{
+    "database_path":"~/.openclaw/subspace-daemon/data/daemon.sqlite3",
+    "artifact_root":"~/.openclaw/subspace-daemon/artifacts",
+    "auto_migrate":true
+  }}
 EOF
 ```
 
@@ -149,13 +156,14 @@ On first boot, the daemon will connect to the gateway and request device approva
 
 ## Install the Skills
 
-The subspace-daemon ships three operator skills. Copy them from the cloned repo:
+The subspace-daemon ships four operator skills. Copy them from the cloned repo:
 
 ```bash
-mkdir -p ~/.openclaw/skills/subspace-sending-messages ~/.openclaw/skills/subspace-connection-management ~/.openclaw/skills/subspace-receptor-config
+mkdir -p ~/.openclaw/skills/subspace-sending-messages ~/.openclaw/skills/subspace-connection-management ~/.openclaw/skills/subspace-receptor-config ~/.openclaw/skills/subspace-sink-config
 cp ~/src/subspace-daemon/skill/sending-messages/SKILL.md ~/.openclaw/skills/subspace-sending-messages/SKILL.md
 cp ~/src/subspace-daemon/skill/connection-management/SKILL.md ~/.openclaw/skills/subspace-connection-management/SKILL.md
 cp ~/src/subspace-daemon/skill/receptor-config/SKILL.md ~/.openclaw/skills/subspace-receptor-config/SKILL.md
+cp ~/src/subspace-daemon/skill/sink-config/SKILL.md ~/.openclaw/skills/subspace-sink-config/SKILL.md
 ```
 
 ### Skill 1: Sending Messages
@@ -886,6 +894,10 @@ Each enabled server manager owns its own `AttentionLayer`.
 - `attention.local_pack_paths` is the daemon-wide default receptor pack set.
 - `servers[].local_pack_paths` optionally overrides that set for one server.
 - `servers[].local_pack_paths: []` gives passthrough behavior on just that server.
+
+### Skill 4: Sink Config
+
+Sink config covers the matched-message database sink and OpenClaw agent-session wake sink. Agents use it to decide whether accepted messages should be stored, should wake a session, or both. The wake sink targets `routing.wake_session_key` or a per-server `servers[].wake_session_key`; agents must verify the exact session key before changing it.
 
 ## Setup Notes
 

@@ -9,6 +9,7 @@ mod retry;
 mod runtime_store;
 mod setup;
 mod state_lock;
+mod storage;
 mod subspace;
 mod supervisor;
 

@@ -19,6 +19,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub retry: RetryConfig,
     pub storage: StorageConfig,
+    pub sinks: Vec<SinkConfig>,
     pub paths: AppPaths,
 }
 
@@ -81,6 +82,19 @@ pub struct StorageConfig {
     pub auto_migrate: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkConfig {
+    pub key: String,
+    pub kind: SinkKind,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinkKind {
+    Db,
+    AgentSessionWake,
+}
+
 #[derive(Debug, Clone)]
 pub struct StormGuardConfig {
     pub failure_window_ms: u64,
@@ -134,6 +148,8 @@ pub struct StoredConfig {
     pub retry: StoredRetryConfig,
     #[serde(default)]
     pub storage: StoredStorageConfig,
+    #[serde(default)]
+    pub sinks: Vec<StoredSinkConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -210,6 +226,13 @@ pub struct StoredStorageConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StoredSinkConfig {
+    pub key: Option<String>,
+    pub kind: String,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StoredAttentionConfig {
     #[serde(default)]
     pub local_pack_paths: Vec<String>,
@@ -247,6 +270,7 @@ impl Default for StoredConfig {
             logging: StoredLoggingConfig::default(),
             retry: StoredRetryConfig::default(),
             storage: StoredStorageConfig::default(),
+            sinks: vec![],
         }
     }
 }
@@ -397,8 +421,83 @@ impl Config {
                     .unwrap_or_else(default_artifact_root),
                 auto_migrate: stored.storage.auto_migrate.unwrap_or(true),
             },
+            sinks: normalize_sinks(&stored.sinks)?,
             paths,
         })
+    }
+}
+
+fn normalize_sinks(stored: &[StoredSinkConfig]) -> Result<Vec<SinkConfig>> {
+    let raw = if stored.is_empty() {
+        default_sinks()
+            .into_iter()
+            .map(|sink| StoredSinkConfig {
+                key: Some(sink.key),
+                kind: sink.kind.as_str().to_string(),
+                enabled: Some(sink.enabled),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        stored.to_vec()
+    };
+
+    let mut seen = BTreeSet::new();
+    let mut sinks = Vec::with_capacity(raw.len());
+    for sink in raw {
+        let kind = SinkKind::parse(&sink.kind)?;
+        let key = sink
+            .key
+            .unwrap_or_else(|| kind.default_key().to_string())
+            .trim()
+            .to_string();
+        if key.is_empty() {
+            bail!("sink key must not be empty");
+        }
+        if !seen.insert(key.clone()) {
+            bail!("duplicate sink key: {key}");
+        }
+        sinks.push(SinkConfig {
+            key,
+            kind,
+            enabled: sink.enabled.unwrap_or(true),
+        });
+    }
+    Ok(sinks)
+}
+
+fn default_sinks() -> Vec<SinkConfig> {
+    vec![
+        SinkConfig {
+            key: SinkKind::Db.default_key().to_string(),
+            kind: SinkKind::Db,
+            enabled: true,
+        },
+        SinkConfig {
+            key: SinkKind::AgentSessionWake.default_key().to_string(),
+            kind: SinkKind::AgentSessionWake,
+            enabled: true,
+        },
+    ]
+}
+
+impl SinkKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "db" => Ok(Self::Db),
+            "agent_session_wake" => Ok(Self::AgentSessionWake),
+            other => bail!("unsupported sink kind: {other}"),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Db => "db",
+            Self::AgentSessionWake => "agent_session_wake",
+        }
+    }
+
+    pub fn default_key(&self) -> &'static str {
+        self.as_str()
     }
 }
 
@@ -948,6 +1047,42 @@ mod tests {
             expand_tilde(PathBuf::from("~/.subspace-db/artifacts"))
         );
         assert!(!config.storage.auto_migrate);
+    }
+
+    #[test]
+    fn defaults_enable_db_and_wake_sinks() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(&config_path, r#"{}"#).unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.sinks.len(), 2);
+        assert_eq!(config.sinks[0].kind, SinkKind::Db);
+        assert_eq!(config.sinks[1].kind, SinkKind::AgentSessionWake);
+        assert!(config.sinks.iter().all(|sink| sink.enabled));
+    }
+
+    #[test]
+    fn loads_sink_overrides() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "sinks": [
+                { "kind": "db", "enabled": false },
+                { "key": "wake-primary", "kind": "agent_session_wake", "enabled": true }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.sinks.len(), 2);
+        assert_eq!(config.sinks[0].key, "db");
+        assert!(!config.sinks[0].enabled);
+        assert_eq!(config.sinks[1].key, "wake-primary");
+        assert_eq!(config.sinks[1].kind, SinkKind::AgentSessionWake);
     }
 
     #[test]
