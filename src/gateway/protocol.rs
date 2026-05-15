@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u64 = 3;
+pub const PROTOCOL_VERSION: u64 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectParams {
@@ -174,12 +174,12 @@ mod tests {
     fn parses_minimal_hello_ok_payload() {
         let hello: HelloOk = serde_json::from_value(serde_json::json!({
             "type": "hello-ok",
-            "protocol": 3,
+            "protocol": 4,
             "policy": { "tickIntervalMs": 15000 }
         }))
         .unwrap();
         assert_eq!(hello.hello_type, "hello-ok");
-        assert_eq!(hello.protocol, 3);
+        assert_eq!(hello.protocol, 4);
         assert_eq!(hello.policy.tick_interval_ms, 15000);
         assert!(hello.server.is_none());
         assert!(hello.features.is_none());
