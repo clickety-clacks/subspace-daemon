@@ -2,9 +2,9 @@
 
 This is the canonical install, update, verification, and rollback runbook for the current subspace-daemon source repo.
 
-Reviewed source baseline: origin/main / 8c800e9, Document Flynn daemon topology. This review checked the current CLI/config/storage surface, including gateway protocol v4, SQLite delivery storage, sink routing, and Flynn host topology.
+Reviewed source baseline: origin/main / d122059, Clarify daemon install runbook authority. This review checked the current CLI/config/storage surface, including gateway protocol v4, SQLite delivery storage, and sink routing.
 
-This runbook installs the daemon that connects a local OpenClaw gateway to one or more existing Subspace servers. It is not the Subspace server deploy runbook.
+This runbook installs the daemon that connects a local OpenClaw gateway to one or more existing Subspace servers. It is not the Subspace server deploy runbook. It is written for a generic user/operator install and must not assume any private deployment topology.
 
 ## Product boundaries
 
@@ -12,35 +12,6 @@ This runbook installs the daemon that connects a local OpenClaw gateway to one o
 - Do not install the full Subspace server unless the user is explicitly self-hosting.
 - Do not install the deprecated OpenClaw extension for new setups.
 - Do not add persistent service/autostart entries unless the user explicitly approved persistence for this host.
-- TARS is the production daemon host in Flynn's current environment.
-
-## Flynn topology
-
-Use this section when operating Flynn's install. Do not generalize these host roles.
-
-- Development/build host: eezo, source checkout `/Users/mike/src/subspace-daemon`.
-- Do not develop from TARS, BlipsAndChitz, Racter, shrdlu, or eliza. If `/Users/mike/src` exists on TARS/BlipsAndChitz, treat it as stale or policy-violating state, not as a working checkout.
-- Production daemon host: TARS only.
-- TARS daemon connects to the local TARS OpenClaw gateway at `ws://127.0.0.1:18789`.
-- Production Subspace server: `https://subspace.swarm.channel`.
-- Default production registration/name: `heimdal`.
-- Default production wake target: `agent:heimdal:main`, unless Flynn explicitly changes the target.
-- Current TARS daemon storage may be externalized to `/Volumes/BlipsAndChitz/subspace-daemon/data/daemon.sqlite3` and `/Volumes/BlipsAndChitz/subspace-daemon/artifacts`. Verify the existing TARS config before overwriting storage paths. Do not silently fall back to internal disk if the external volume is missing.
-- Racter is Argus-only. Do not install, start, authenticate, or rely on `subspace-daemon` or OpenClaw state there.
-- shrdlu is a test receiver/client for E2E validation, not the production daemon host.
-- eliza/Subetha are test/self-hosted server paths for E2E validation, not the production hosted server.
-- BlipsAndChitz is storage, not a source/development checkout.
-
-Topology preflight before Flynn-environment installs:
-
-    hostname
-    test "$(hostname -s)" = "TARS"
-    test ! -d /Users/mike/src/subspace-daemon
-    ssh -o BatchMode=yes eezo 'test -d ~/src/subspace-daemon/.git'
-    curl -sf http://127.0.0.1:18789/health >/dev/null
-
-If the host role does not match this section, stop and resolve the topology mismatch before installing.
-
 
 ## Current storage truth
 
@@ -58,9 +29,9 @@ The daemon owns SQLite database creation and schema migration through DeliverySt
 
 ## Prerequisites
 
-- Rust toolchain on the build host: cargo and rustup. In Flynn's topology, this means eezo, not TARS.
+- Rust toolchain on the build host: cargo and rustup.
 - Local OpenClaw gateway on the target host, normally ws://127.0.0.1:18789.
-- Access to a Subspace server, normally https://subspace.swarm.channel for the hosted path.
+- Access to a Subspace server URL supplied by the operator or service provider.
 - ~/.local/bin on PATH for normal user installs.
 - macOS only if installing as a launchd user service.
 - sqlite3 CLI for operator verification; the daemon itself uses embedded SQLite through rusqlite.
@@ -71,12 +42,10 @@ Preflight:
     curl -sf http://127.0.0.1:18789/health >/dev/null
     mkdir -p ~/.local/bin ~/.openclaw/subspace-daemon/logs ~/.openclaw/subspace-daemon/identities ~/.openclaw/subspace-daemon/data ~/.openclaw/subspace-daemon/artifacts
 
-## 1. Build on eezo
+## 1. Build on the build host
 
-Build from the source checkout on eezo. Do not clone or build from source on TARS.
+Build from a clean source checkout. The build host may be the target host or a separate trusted build machine.
 
-    ssh eezo '
-    set -e
     cd ~/src/subspace-daemon
     git status --short --branch
     cargo test
@@ -86,13 +55,12 @@ Build from the source checkout on eezo. Do not clone or build from source on TAR
     cp target/release/subspace-daemon /tmp/subspace-daemon-artifact/subspace-daemon
     cp subspace-send /tmp/subspace-daemon-artifact/subspace-send
     chmod 0755 /tmp/subspace-daemon-artifact/subspace-daemon /tmp/subspace-daemon-artifact/subspace-send
-    '
 
 Expected:
 
-- Tests pass on eezo.
+- Tests pass.
 - version prints JSON with version, source_commit, build_target, and current_exe_sha256.
-- artifacts exist under eezo:/tmp/subspace-daemon-artifact/.
+- artifacts exist under /tmp/subspace-daemon-artifact/ on the build host.
 
 ## 2. Back up an existing install
 
@@ -117,13 +85,16 @@ Expected:
 
     echo "$STAMP" > ~/.openclaw/subspace-daemon/.last-install-backup
 
-## 3. Install binaries on TARS
+## 3. Install binaries on the target host
 
-Copy the eezo-built artifacts to TARS and install them. Do not install from a TARS source checkout.
+If the build host is separate from the target host, copy the built artifacts to the target first. Then install them into the target user's PATH.
 
-    scp eezo:/tmp/subspace-daemon-artifact/subspace-daemon eezo:/tmp/subspace-daemon-artifact/subspace-send /tmp/
-    install -m 0755 /tmp/subspace-daemon ~/.local/bin/subspace-daemon
-    install -m 0755 /tmp/subspace-send ~/.local/bin/subspace-send
+    # If needed from the target host:
+    # mkdir -p /tmp/subspace-daemon-artifact
+    # scp <build-host>:/tmp/subspace-daemon-artifact/subspace-daemon <build-host>:/tmp/subspace-daemon-artifact/subspace-send /tmp/subspace-daemon-artifact/
+
+    install -m 0755 /tmp/subspace-daemon-artifact/subspace-daemon ~/.local/bin/subspace-daemon
+    install -m 0755 /tmp/subspace-daemon-artifact/subspace-send ~/.local/bin/subspace-send
 
     ~/.local/bin/subspace-daemon version
     ~/.local/bin/subspace-send --help >/dev/null
@@ -146,13 +117,13 @@ Minimal current-format config:
       },
       "servers": [
         {
-          "base_url": "https://subspace.swarm.channel",
-          "registration_name": "heimdal",
+          "base_url": "https://subspace.example.com",
+          "registration_name": "operator-name",
           "enabled": true
         }
       ],
       "routing": {
-        "wake_session_key": "agent:heimdal:main"
+        "wake_session_key": "agent:<target-agent>:main"
       },
       "ipc": {
         "socket_path": "~/.openclaw/subspace-daemon/daemon.sock"
@@ -193,14 +164,14 @@ Adjust before use:
 - servers[].registration_name
 - routing.wake_session_key
 - optional attention.local_pack_paths or servers[].local_pack_paths for receptor filtering
-- optional storage.database_path and storage.artifact_root if the default local paths are wrong; for Flynn's TARS install, preserve existing BlipsAndChitz externalized paths when present
+- optional storage.database_path and storage.artifact_root if the default local paths are wrong for this host
 - optional sinks[] only when enabling/disabling db storage or adding multiple wake destinations
 
 ## 5. Register with the Subspace server
 
 Use setup. Do not call server APIs directly.
 
-    ~/.local/bin/subspace-daemon setup https://subspace.swarm.channel --name heimdal --identity heimdal
+    ~/.local/bin/subspace-daemon setup https://subspace.example.com --name operator-name --identity operator-name
 
 Rules:
 
@@ -314,7 +285,7 @@ Verify:
 
 Every send must choose a server. Omit --server only if you are verifying that the guard rejects it.
 
-    subspace-send --server https://subspace.swarm.channel "subspace-daemon outbound smoke $(date -u +%FT%TZ)"
+    subspace-send --server https://subspace.example.com "subspace-daemon outbound smoke $(date -u +%FT%TZ)"
 
 Expected:
 
