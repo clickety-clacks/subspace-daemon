@@ -2,7 +2,7 @@
 
 This is the canonical install, update, verification, and rollback runbook for the current subspace-daemon source repo.
 
-Reviewed source baseline: origin/main / cded462, Make daemon install runbook topology-neutral. This review checked the current CLI/config/storage surface, including gateway protocol v4, SQLite delivery storage, and sink routing.
+Reviewed source baseline: origin/main as of 2026-05-15. This review checked the current CLI/config/storage surface, including gateway protocol v4, SQLite delivery storage, and sink routing.
 
 This runbook installs the daemon that connects a local OpenClaw gateway to one or more existing Subspace servers. It is not the Subspace server deploy runbook. It is written for a generic user/operator install and must not assume any private deployment topology.
 
