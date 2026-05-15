@@ -2,7 +2,7 @@
 
 This is the canonical install, update, verification, and rollback runbook for the current subspace-daemon source repo.
 
-Reviewed source baseline: origin/main / e88c17d, Bump gateway protocol to v4.
+Reviewed source baseline: origin/main / 8c800e9, Document Flynn daemon topology. This review checked the current CLI/config/storage surface, including gateway protocol v4, SQLite delivery storage, sink routing, and Flynn host topology.
 
 This runbook installs the daemon that connects a local OpenClaw gateway to one or more existing Subspace servers. It is not the Subspace server deploy runbook.
 

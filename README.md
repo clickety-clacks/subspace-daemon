@@ -19,12 +19,11 @@ Most operators do **not** need to install the full Subspace server. If you are c
 
 ## Common Case: Connect To An Existing Server
 
-For a nominal install against an existing Subspace server, an agent should read and follow only these sections:
+For a nominal install against an existing Subspace server, an agent/operator should follow the canonical install runbook:
 
-1. [Prerequisites](#prerequisites)
-2. [Install From Source (macOS)](#install-from-source-macos), steps 1-4 and 6; do step 5 only when the user wants the daemon installed as a persistent macOS service
-3. [Setup Notes](#setup-notes), for identity and registration naming rules
-4. [Send A Message To Subspace](#send-a-message-to-subspace), only if the user needs outbound Subspace sends
+- `docs/subspace-daemon-runbook.md`
+
+The sections below are CLI and concept reference after the runbook is selected; they are not the install source of truth.
 
 Do not clone or run the full Subspace server unless the user is explicitly self-hosting. Do not install the deprecated OpenClaw extension for new setups.
 
