@@ -586,7 +586,7 @@ mod tests {
         let canonical = canonicalize_base_url(server).unwrap();
         let status = Arc::new(RwLock::new(DaemonStatus {
             gateway_state: "live".to_string(),
-            wake_session_key: "agent:heimdal:main".to_string(),
+            wake_session_key: "agent:target:main".to_string(),
             servers: BTreeMap::from([(
                 canonical.clone(),
                 ServerHealth {

@@ -374,7 +374,7 @@ impl Config {
                 wake_session_key: stored
                     .routing
                     .wake_session_key
-                    .unwrap_or_else(|| "agent:heimdal:main".to_string()),
+                    .unwrap_or_else(|| "agent:main:main".to_string()),
             },
             replay: ReplayConfig {
                 dedupe_window_size: stored.replay.dedupe_window_size.unwrap_or(500),
@@ -960,7 +960,7 @@ mod tests {
 
         let config = Config::load(config_path).unwrap();
         assert_eq!(config.servers[0].wake_session_key, None);
-        assert_eq!(config.routing.wake_session_key, "agent:heimdal:main");
+        assert_eq!(config.routing.wake_session_key, "agent:main:main");
     }
 
     #[test]

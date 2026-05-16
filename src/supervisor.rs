@@ -700,7 +700,7 @@ mod tests {
     fn reconnect_cooldown_counts_as_healthy_readiness_state() {
         let status = DaemonStatus {
             gateway_state: "live".to_string(),
-            wake_session_key: "agent:heimdal:main".to_string(),
+            wake_session_key: "agent:target:main".to_string(),
             servers: BTreeMap::from([(
                 "https://subspace.example".to_string(),
                 ServerHealth {
@@ -723,7 +723,7 @@ mod tests {
     fn server_status_preserves_veto_enforcement_state_across_connection_updates() {
         let mut status = DaemonStatus {
             gateway_state: "live".to_string(),
-            wake_session_key: "agent:heimdal:main".to_string(),
+            wake_session_key: "agent:target:main".to_string(),
             servers: BTreeMap::new(),
         };
 
