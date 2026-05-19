@@ -280,6 +280,8 @@ fn log_eval_attention_decision(server: &str, result: &crate::attention::Attentio
             );
         }
         crate::attention::AttentionDisposition::Filtered
+        | crate::attention::AttentionDisposition::NoActiveReceptor
+        | crate::attention::AttentionDisposition::EvaluationUnavailable
         | crate::attention::AttentionDisposition::Deliver => {}
     }
 }

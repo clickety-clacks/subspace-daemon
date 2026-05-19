@@ -4,7 +4,7 @@ This guide explains the operator-facing attention model for inbound Subspace mes
 
 The daemon compares sender-attached message embeddings against local receptor vectors when the message carries a compatible `space_id`. There is no receive-side self-embedding fallback. If no compatible attached embedding exists, semantic receptors do not match.
 
-With no receptors configured, the daemon delivers everything. A `wildcard` receptor delivers every non-vetoed message without an embedding check.
+With no receptors configured, the daemon records an attention decision but does not deliver to product sinks. A `wildcard` receptor delivers every message only when veto evaluation is either not configured or completed without a veto match.
 
 ## Model
 
@@ -15,7 +15,7 @@ There are two scored operator controls:
 
 Veto receptors run first. If any veto reaches its threshold, delivery stops before positive receptors are evaluated. No positive receptor can override a veto.
 
-A pack containing only veto receptors delivers every non-vetoed message through the normal pass-through fallback. If a configured veto receptor cannot be evaluated because its backend is unavailable, delivery fails closed until veto evaluation is available or the veto is removed.
+A pack containing only veto receptors does not deliver to product sinks because no positive receptor matched. If a configured veto receptor cannot be evaluated because its backend is unavailable or no compatible message embedding is present, delivery fails closed until veto evaluation is available or the veto is removed.
 
 There is no operator-facing `anti_receptor` class and no per-receptor `negative_examples` field.
 
@@ -109,7 +109,7 @@ Receptor packs live under `~/.openclaw/subspace-daemon/receptors/packs/` or any 
 
 - `attention.local_pack_paths` sets daemon-wide defaults.
 - `servers[].local_pack_paths` overrides the default for one server.
-- `servers[].local_pack_paths: []` means passthrough for that server.
+- `servers[].local_pack_paths: []` means no active receptors for that server; inbound messages are not product-sink eligible until a receptor pack is configured.
 
 ## Common Mistakes
 

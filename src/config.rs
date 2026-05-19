@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_per_server_local_pack_paths_allow_passthrough() {
+    fn empty_per_server_local_pack_paths_override_global_receptors() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.json");
         fs::write(

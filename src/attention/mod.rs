@@ -61,7 +61,9 @@ pub struct OutboundEmbeddingRequest {
 pub enum AttentionDisposition {
     Deliver,
     Filtered,
+    NoActiveReceptor,
     Vetoed,
+    EvaluationUnavailable,
     VetoEnforcementUnavailable,
 }
 
@@ -84,7 +86,7 @@ pub struct AttentionResult {
     pub matches: Vec<ReceptorMatch>,
     /// The space_id used for embedding, if any.
     pub space_id: Option<String>,
-    /// Whether this was a fallback decision (no receptors or plugin failure).
+    /// Whether evaluation reached a no-active-receptor fallback path.
     pub fallback: bool,
     pub disposition: AttentionDisposition,
     pub veto_not_evaluated: bool,
@@ -105,7 +107,7 @@ pub struct AttentionLayer {
 }
 
 impl AttentionLayer {
-    /// Create a new attention layer that delivers all messages (no filtering).
+    /// Create a new attention layer with no active receptors configured.
     pub fn passthrough() -> Self {
         Self {
             receptors: Vec::new(),
@@ -319,26 +321,26 @@ impl AttentionLayer {
             };
         }
 
-        // Fallback: deliver all if no receptors configured
-        if self.receptors.is_empty() {
+        // Degraded evaluation cannot prove a receptor match, so it cannot feed sinks.
+        if self.degraded {
             return AttentionResult {
-                deliver: true,
+                deliver: false,
                 matches: Vec::new(),
-                space_id: None,
-                fallback: true,
-                disposition: AttentionDisposition::Deliver,
+                space_id: self.space_id.clone(),
+                fallback: false,
+                disposition: AttentionDisposition::EvaluationUnavailable,
                 veto_not_evaluated: false,
             };
         }
 
-        // Fallback: deliver all if in degraded mode
-        if self.degraded {
+        // No active receptors means no product sink delivery.
+        if self.receptors.is_empty() {
             return AttentionResult {
-                deliver: true,
+                deliver: false,
                 matches: Vec::new(),
-                space_id: self.space_id.clone(),
+                space_id: None,
                 fallback: true,
-                disposition: AttentionDisposition::Deliver,
+                disposition: AttentionDisposition::NoActiveReceptor,
                 veto_not_evaluated: false,
             };
         }
@@ -381,12 +383,13 @@ impl AttentionLayer {
         }
 
         if !has_interest_receptor {
+            matches.sort_by(score_desc);
             return AttentionResult {
-                deliver: true,
+                deliver: false,
                 matches,
                 space_id: selected_vector.map(|(_, space_id)| space_id),
                 fallback: true,
-                disposition: AttentionDisposition::Deliver,
+                disposition: AttentionDisposition::NoActiveReceptor,
                 veto_not_evaluated,
             };
         }
@@ -397,6 +400,16 @@ impl AttentionLayer {
             .find(|receptor| receptor.is_wildcard());
 
         let Some((message_vector, vector_space_id)) = selected_vector else {
+            if veto_not_evaluated {
+                return AttentionResult {
+                    deliver: false,
+                    matches,
+                    space_id: None,
+                    fallback: false,
+                    disposition: AttentionDisposition::EvaluationUnavailable,
+                    veto_not_evaluated,
+                };
+            }
             if let Some(receptor) = wildcard {
                 matches.push(ReceptorMatch {
                     receptor_id: receptor.receptor_id.clone(),
@@ -504,6 +517,41 @@ impl AttentionLayer {
     /// Get the number of configured receptors.
     pub fn receptor_count(&self) -> usize {
         self.receptors.len()
+    }
+
+    pub fn interest_receptor_count(&self) -> usize {
+        self.receptors
+            .iter()
+            .filter(|receptor| !receptor.is_veto())
+            .count()
+    }
+
+    pub fn veto_receptor_count(&self) -> usize {
+        self.receptors
+            .iter()
+            .filter(|receptor| receptor.is_veto())
+            .count()
+    }
+
+    pub fn wildcard_receptor_count(&self) -> usize {
+        self.receptors
+            .iter()
+            .filter(|receptor| receptor.is_wildcard())
+            .count()
+    }
+
+    pub fn delivery_mode(&self) -> &'static str {
+        if self.veto_enforcement_unavailable {
+            "veto_enforcement_unavailable"
+        } else if self.degraded {
+            "evaluation_unavailable"
+        } else if self.receptors.is_empty() {
+            "no_active_receptors"
+        } else if self.interest_receptor_count() == 0 {
+            "veto_only_no_positive_receptors"
+        } else {
+            "receptor_gated"
+        }
     }
 
     /// Check if the attention layer is in degraded mode.
@@ -749,11 +797,12 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn passthrough_delivers_all() {
+    async fn passthrough_without_receptors_is_not_sink_eligible() {
         let layer = AttentionLayer::passthrough();
         let result = layer.evaluate("any message", &[]).await;
-        assert!(result.deliver);
+        assert!(!result.deliver);
         assert!(result.fallback);
+        assert_eq!(result.disposition, AttentionDisposition::NoActiveReceptor);
     }
 
     #[tokio::test]
@@ -880,7 +929,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_backend_with_receptors_degrades_to_passthrough() {
+    async fn missing_backend_with_receptors_filters_without_match_evidence() {
         let layer = AttentionLayer {
             receptors: vec![ComputedReceptor {
                 receptor_id: "match".to_string(),
@@ -897,8 +946,24 @@ mod tests {
 
         let result = layer.evaluate("plaintext only", &[]).await;
 
-        assert!(result.deliver);
+        assert!(!result.deliver);
+        assert!(!result.fallback);
+        assert_eq!(
+            result.disposition,
+            AttentionDisposition::EvaluationUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn no_receptors_filter_without_sink_delivery_eligibility() {
+        let layer = AttentionLayer::passthrough();
+
+        let result = layer.evaluate("plaintext only", &[]).await;
+
+        assert!(!result.deliver);
         assert!(result.fallback);
+        assert_eq!(result.disposition, AttentionDisposition::NoActiveReceptor);
+        assert!(result.matches.is_empty());
     }
 
     #[tokio::test]
@@ -966,8 +1031,12 @@ mod tests {
         assert!(layer.is_degraded());
         assert!(!layer.is_veto_enforcement_unavailable());
         assert_eq!(layer.veto_enforcement_state(), "not_configured");
-        assert!(result.deliver);
-        assert!(result.fallback);
+        assert!(!result.deliver);
+        assert!(!result.fallback);
+        assert_eq!(
+            result.disposition,
+            AttentionDisposition::EvaluationUnavailable
+        );
     }
 
     #[tokio::test]
@@ -1033,8 +1102,12 @@ mod tests {
         let result = layer.evaluate("plaintext only", &[]).await;
 
         assert!(layer.is_degraded());
-        assert!(result.deliver);
-        assert!(result.fallback);
+        assert!(!result.deliver);
+        assert!(!result.fallback);
+        assert_eq!(
+            result.disposition,
+            AttentionDisposition::EvaluationUnavailable
+        );
     }
 
     #[tokio::test]
@@ -1135,7 +1208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn veto_only_pack_delivers_when_no_veto_matches() {
+    async fn veto_only_pack_filters_when_no_positive_receptor_matches() {
         let layer = AttentionLayer {
             receptors: vec![ComputedReceptor {
                 receptor_id: "spam-veto".to_string(),
@@ -1160,8 +1233,8 @@ mod tests {
             )
             .await;
 
-        assert!(result.deliver);
-        assert_eq!(result.disposition, AttentionDisposition::Deliver);
+        assert!(!result.deliver);
+        assert_eq!(result.disposition, AttentionDisposition::NoActiveReceptor);
         assert!(result.fallback);
         assert_eq!(result.matches.len(), 1);
         assert!(!result.matches[0].above_threshold);
@@ -1195,8 +1268,47 @@ mod tests {
         let result = layer.evaluate("plaintext only", &[]).await;
 
         assert!(!result.deliver);
-        assert_eq!(result.disposition, AttentionDisposition::Filtered);
+        assert_eq!(
+            result.disposition,
+            AttentionDisposition::EvaluationUnavailable
+        );
         assert!(result.veto_not_evaluated);
+    }
+
+    #[tokio::test]
+    async fn wildcard_does_not_deliver_when_veto_cannot_be_evaluated() {
+        let layer = AttentionLayer {
+            receptors: vec![
+                ComputedReceptor {
+                    receptor_id: "spam-veto".to_string(),
+                    class: ReceptorClass::Veto,
+                    threshold: 0.8,
+                    vector: Some(vec![1.0, 0.0]),
+                    space_id: Some("test:model:2:v1".to_string()),
+                },
+                ComputedReceptor {
+                    receptor_id: "all".to_string(),
+                    class: ReceptorClass::Wildcard,
+                    threshold: 1.0,
+                    vector: None,
+                    space_id: None,
+                },
+            ],
+            plugin: None,
+            space_id: Some("test:model:2:v1".to_string()),
+            degraded: false,
+            veto_enforcement_unavailable: false,
+        };
+
+        let result = layer.evaluate("plaintext only", &[]).await;
+
+        assert!(!result.deliver);
+        assert_eq!(
+            result.disposition,
+            AttentionDisposition::EvaluationUnavailable
+        );
+        assert!(result.veto_not_evaluated);
+        assert!(result.matches.is_empty());
     }
 
     #[tokio::test]

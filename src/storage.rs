@@ -11,6 +11,7 @@ use crate::supervisor::WakeEnvelope;
 
 const REQUIRED_TABLES: &[&str] = &[
     "ingress_source",
+    "attention_decision",
     "daemon_event",
     "event_idempotency",
     "receptor_match",
@@ -70,6 +71,7 @@ impl DeliveryStore {
     }
 
     pub fn ensure_ready(&self) -> Result<()> {
+        fs::create_dir_all(&self.artifact_root)?;
         self.with_connection(|conn| {
             ensure_schema(conn, self.auto_migrate)?;
             Ok(())
@@ -80,6 +82,54 @@ impl DeliveryStore {
         &self.database_path
     }
 
+    pub fn record_attention_decision(
+        &self,
+        envelope: &WakeEnvelope,
+        attention: &AttentionResult,
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            ensure_schema(conn, self.auto_migrate)?;
+            let ingress_source_id =
+                upsert_ingress_source(conn, &envelope.server, &envelope.server_key)?;
+            let evidence_json = attention_evidence_json(attention).to_string();
+            conn.execute(
+                "INSERT INTO attention_decision (
+                    ingress_source_id,
+                    message_id,
+                    message_timestamp,
+                    disposition,
+                    delivery_eligible,
+                    attention_space_id,
+                    attention_fallback,
+                    veto_not_evaluated,
+                    evidence_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(ingress_source_id, message_id)
+                DO UPDATE SET
+                    message_timestamp = excluded.message_timestamp,
+                    disposition = excluded.disposition,
+                    delivery_eligible = excluded.delivery_eligible,
+                    attention_space_id = excluded.attention_space_id,
+                    attention_fallback = excluded.attention_fallback,
+                    veto_not_evaluated = excluded.veto_not_evaluated,
+                    evidence_json = excluded.evidence_json,
+                    decided_at = CURRENT_TIMESTAMP",
+                params![
+                    ingress_source_id,
+                    envelope.message_id,
+                    envelope.timestamp,
+                    attention_disposition_str(attention.disposition),
+                    if attention.deliver { 1 } else { 0 },
+                    attention.space_id,
+                    if attention.fallback { 1 } else { 0 },
+                    if attention.veto_not_evaluated { 1 } else { 0 },
+                    evidence_json,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn record_db_sink_delivery(
         &self,
         envelope: &WakeEnvelope,
@@ -87,6 +137,8 @@ impl DeliveryStore {
         sink: &SinkConfig,
         routing: &RoutingSnapshot<'_>,
     ) -> Result<EventRecord> {
+        ensure_receptor_accepted_for_sink_delivery(attention)?;
+        fs::create_dir_all(&self.artifact_root)?;
         self.with_connection(|conn| {
             ensure_schema(conn, self.auto_migrate)?;
             let event = upsert_canonical_event(conn, envelope, attention, routing)?;
@@ -121,6 +173,7 @@ impl DeliveryStore {
         snapshot: &SinkSnapshot<'_>,
         routing: &RoutingSnapshot<'_>,
     ) -> Result<DeliveryTicket> {
+        ensure_receptor_accepted_for_sink_delivery(attention)?;
         self.with_connection(|conn| {
             ensure_schema(conn, self.auto_migrate)?;
             let event = upsert_canonical_event(conn, envelope, attention, routing)?;
@@ -224,7 +277,6 @@ impl DeliveryStore {
         if let Some(parent) = self.database_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::create_dir_all(&self.artifact_root)?;
         let conn = Connection::open(&self.database_path)
             .with_context(|| format!("open sqlite {}", self.database_path.display()))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -239,21 +291,33 @@ fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
         );
     }
     let missing = missing_required_tables(conn)?;
-    if missing.is_empty() {
-        return Ok(());
-    }
-    if !auto_migrate {
+    if !missing.is_empty() && !auto_migrate {
         bail!(
             "database schema incomplete; missing tables: {} and storage.auto_migrate is false",
             missing.join(", ")
         );
     }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ingress_source (
+    if !missing.is_empty() {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ingress_source (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             server TEXT NOT NULL,
             server_key TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS attention_decision (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ingress_source_id INTEGER NOT NULL REFERENCES ingress_source(id) ON DELETE RESTRICT,
+            message_id TEXT NOT NULL,
+            message_timestamp TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            delivery_eligible INTEGER NOT NULL,
+            attention_space_id TEXT,
+            attention_fallback INTEGER NOT NULL,
+            veto_not_evaluated INTEGER NOT NULL,
+            evidence_json TEXT NOT NULL,
+            decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(ingress_source_id, message_id)
         );
         CREATE TABLE IF NOT EXISTS daemon_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,6 +331,8 @@ fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
             sender_embeddings_json TEXT,
             attention_space_id TEXT,
             attention_fallback INTEGER NOT NULL,
+            attention_disposition TEXT NOT NULL,
+            attention_delivery_mode TEXT NOT NULL,
             payload_json TEXT,
             raw_body TEXT,
             accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -331,11 +397,14 @@ fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
             metadata_json TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_attention_decision_disposition ON attention_decision(disposition);
         CREATE INDEX IF NOT EXISTS idx_daemon_event_ingress_message ON daemon_event(ingress_source_id, message_id);
         CREATE INDEX IF NOT EXISTS idx_receptor_match_event ON receptor_match(daemon_event_id);
         CREATE INDEX IF NOT EXISTS idx_sink_delivery_event ON sink_delivery(daemon_event_id);
         CREATE INDEX IF NOT EXISTS idx_sink_delivery_status ON sink_delivery(status);",
-    )?;
+        )?;
+    }
+    ensure_daemon_event_columns(conn, auto_migrate)?;
     let missing_after_migration = missing_required_tables(conn)?;
     if !missing_after_migration.is_empty() {
         bail!(
@@ -344,6 +413,49 @@ fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn ensure_daemon_event_columns(conn: &Connection, auto_migrate: bool) -> Result<()> {
+    let columns = daemon_event_columns(conn)?;
+    let missing = [
+        ("attention_disposition", "TEXT NOT NULL DEFAULT 'deliver'"),
+        (
+            "attention_delivery_mode",
+            "TEXT NOT NULL DEFAULT 'unknown_legacy'",
+        ),
+    ]
+    .into_iter()
+    .filter(|(column, _)| !columns.contains(&column.to_string()))
+    .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !auto_migrate {
+        bail!(
+            "storage.auto_migrate is false and daemon_event is missing columns: {}",
+            missing
+                .iter()
+                .map(|(column, _)| *column)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for (column, definition) in missing {
+        conn.execute(
+            &format!("ALTER TABLE daemon_event ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn daemon_event_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(daemon_event)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns)
 }
 
 fn missing_required_tables(conn: &Connection) -> Result<Vec<String>> {
@@ -415,9 +527,11 @@ fn upsert_canonical_event(
             sender_embeddings_json,
             attention_space_id,
             attention_fallback,
+            attention_disposition,
+            attention_delivery_mode,
             payload_json,
             raw_body
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             ingress_source_id,
             envelope.message_id,
@@ -429,6 +543,8 @@ fn upsert_canonical_event(
             sender_embeddings_json,
             attention.space_id,
             if attention.fallback { 1 } else { 0 },
+            attention_disposition_str(attention.disposition),
+            attention_delivery_mode(attention),
             payload_json,
             envelope.text,
         ],
@@ -512,6 +628,48 @@ fn upsert_receptor_matches(
         )?;
     }
     Ok(())
+}
+
+fn ensure_receptor_accepted_for_sink_delivery(attention: &AttentionResult) -> Result<()> {
+    if !attention.deliver || attention.disposition != AttentionDisposition::Deliver {
+        bail!(
+            "sink delivery requires deliver disposition; got {:?}",
+            attention.disposition
+        );
+    }
+    if attention.veto_not_evaluated {
+        bail!("sink delivery requires completed veto evaluation");
+    }
+    if attention.fallback {
+        bail!("sink delivery requires explicit receptor evaluation");
+    }
+    if !attention
+        .matches
+        .iter()
+        .any(|matched| matched.above_threshold && matched.class.as_str() != "veto")
+    {
+        bail!("sink delivery requires at least one accepted receptor match");
+    }
+    Ok(())
+}
+
+fn attention_disposition_str(disposition: AttentionDisposition) -> &'static str {
+    match disposition {
+        AttentionDisposition::Deliver => "deliver",
+        AttentionDisposition::Filtered => "filtered",
+        AttentionDisposition::NoActiveReceptor => "no_active_receptor",
+        AttentionDisposition::Vetoed => "vetoed",
+        AttentionDisposition::EvaluationUnavailable => "evaluation_unavailable",
+        AttentionDisposition::VetoEnforcementUnavailable => "veto_enforcement_unavailable",
+    }
+}
+
+fn attention_delivery_mode(attention: &AttentionResult) -> &'static str {
+    if attention.fallback {
+        "implicit_wildcard_fallback"
+    } else {
+        "receptor_gated"
+    }
 }
 
 fn soft_disable_missing_sink_targets(conn: &Connection, sinks: &[SinkConfig]) -> Result<()> {
@@ -674,6 +832,30 @@ fn receptor_routing_json(
     })
 }
 
+fn attention_evidence_json(attention: &AttentionResult) -> serde_json::Value {
+    json!({
+        "matches": attention
+            .matches
+            .iter()
+            .map(|matched| {
+                json!({
+                    "receptor_id": matched.receptor_id,
+                    "receptor_class": matched.class.as_str(),
+                    "score": matched.score,
+                    "threshold": matched.threshold,
+                    "above_threshold": matched.above_threshold,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "match_count": attention.matches.len(),
+        "accepted_match_count": attention
+            .matches
+            .iter()
+            .filter(|matched| matched.above_threshold)
+            .count(),
+    })
+}
+
 fn routing_entries_json(entries: &[SinkRoutingEntry]) -> Vec<serde_json::Value> {
     entries
         .iter()
@@ -736,6 +918,68 @@ mod tests {
             fallback: false,
             disposition: AttentionDisposition::Deliver,
             veto_not_evaluated: false,
+        }
+    }
+
+    fn no_active_receptor_attention() -> AttentionResult {
+        AttentionResult {
+            deliver: false,
+            matches: Vec::new(),
+            space_id: None,
+            fallback: true,
+            disposition: AttentionDisposition::NoActiveReceptor,
+            veto_not_evaluated: false,
+        }
+    }
+
+    fn filtered_attention() -> AttentionResult {
+        AttentionResult {
+            deliver: false,
+            matches: vec![ReceptorMatch {
+                receptor_id: "apple-platforms".to_string(),
+                class: crate::attention::receptor::ReceptorClass::Broad,
+                score: 0.3,
+                threshold: 0.7,
+                above_threshold: false,
+            }],
+            space_id: Some("space:test".to_string()),
+            fallback: false,
+            disposition: AttentionDisposition::Filtered,
+            veto_not_evaluated: false,
+        }
+    }
+
+    fn vetoed_attention() -> AttentionResult {
+        AttentionResult {
+            deliver: false,
+            matches: vec![ReceptorMatch {
+                receptor_id: "spam-veto".to_string(),
+                class: crate::attention::receptor::ReceptorClass::Veto,
+                score: 0.9,
+                threshold: 0.8,
+                above_threshold: true,
+            }],
+            space_id: Some("space:test".to_string()),
+            fallback: false,
+            disposition: AttentionDisposition::Vetoed,
+            veto_not_evaluated: false,
+        }
+    }
+
+    fn veto_not_evaluated_wildcard_attention() -> AttentionResult {
+        AttentionResult {
+            deliver: true,
+            matches: vec![ReceptorMatch {
+                receptor_id: "all".to_string(),
+                class: crate::attention::receptor::ReceptorClass::Wildcard,
+                score: 1.0,
+                threshold: 1.0,
+                above_threshold: true,
+            }],
+            space_id: None,
+            fallback: false,
+            disposition: AttentionDisposition::Deliver,
+            veto_not_evaluated: true,
         }
     }
 
@@ -842,6 +1086,132 @@ mod tests {
         assert!(first.inserted);
         assert!(!second.inserted);
         assert_eq!(counts, (1, 1, 1, 1, 1, 1, 0));
+    }
+
+    #[test]
+    fn no_active_receptor_records_decision_without_product_sink_rows() {
+        let dir = tempdir().unwrap();
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: dir.path().join("daemon.sqlite3"),
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+        let envelope = test_envelope(dir.path());
+        let attention = no_active_receptor_attention();
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
+
+        store
+            .record_attention_decision(&envelope, &attention)
+            .unwrap();
+        let err = store
+            .record_db_sink_delivery(&envelope, &attention, &db_sink_config(None), &routing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sink delivery requires deliver disposition"));
+
+        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
+        let decision: (String, i64, i64, String) = conn
+            .query_row(
+                "SELECT disposition, delivery_eligible, attention_fallback, evidence_json FROM attention_decision",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(decision.0, "no_active_receptor");
+        assert_eq!(decision.1, 0);
+        assert_eq!(decision.2, 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&decision.3).unwrap()["match_count"],
+            0
+        );
+        assert_eq!(store.counts().unwrap(), (1, 0, 0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn filtered_and_vetoed_attention_do_not_create_sink_delivery_rows() {
+        let dir = tempdir().unwrap();
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: dir.path().join("daemon.sqlite3"),
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+        let mut filtered_envelope = test_envelope(dir.path());
+        filtered_envelope.message_id = "filtered-msg".to_string();
+        let mut vetoed_envelope = test_envelope(dir.path());
+        vetoed_envelope.message_id = "vetoed-msg".to_string();
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
+        let wake_snapshot = SinkSnapshot {
+            sink_key: "wake-primary",
+            sink_kind: SinkKind::AgentSessionWake,
+            destination: "agent:test:main",
+            config_json: json!({"session_key": "agent:test:main"}).to_string(),
+        };
+
+        store
+            .record_attention_decision(&filtered_envelope, &filtered_attention())
+            .unwrap();
+        let filtered_err = store
+            .record_db_sink_delivery(
+                &filtered_envelope,
+                &filtered_attention(),
+                &db_sink_config(None),
+                &routing,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(filtered_err.contains("sink delivery requires deliver disposition"));
+
+        store
+            .record_attention_decision(&vetoed_envelope, &vetoed_attention())
+            .unwrap();
+        let vetoed_err = store
+            .queue_wake_sink_delivery(
+                &vetoed_envelope,
+                &vetoed_attention(),
+                &wake_snapshot,
+                &routing,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(vetoed_err.contains("sink delivery requires deliver disposition"));
+
+        let counts = store.counts().unwrap();
+        assert_eq!(counts, (1, 0, 0, 0, 0, 0, 0));
+        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
+        let decisions: Vec<String> = conn
+            .prepare("SELECT disposition FROM attention_decision ORDER BY message_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            decisions,
+            vec!["filtered".to_string(), "vetoed".to_string()]
+        );
+    }
+
+    #[test]
+    fn sink_delivery_rejects_wildcard_when_veto_was_not_evaluated() {
+        let dir = tempdir().unwrap();
+        let store = DeliveryStore::new(&StorageConfig {
+            database_path: dir.path().join("daemon.sqlite3"),
+            artifact_root: dir.path().join("artifacts"),
+            auto_migrate: true,
+        });
+        let envelope = test_envelope(dir.path());
+        let attention = veto_not_evaluated_wildcard_attention();
+        let routing_entries = test_routing();
+        let routing = routing_snapshot(&routing_entries);
+
+        let err = store
+            .record_db_sink_delivery(&envelope, &attention, &db_sink_config(None), &routing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sink delivery requires completed veto evaluation"));
+        assert_eq!(store.counts().unwrap(), (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[test]

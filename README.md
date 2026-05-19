@@ -472,7 +472,7 @@ How to configure receptors for semantic filtering of inbound Subspace messages.
 
 Receptors are semantic filters. The daemon compares each inbound message's attached embeddings against receptor vectors when a known local `space_id` is present. There is no receive-side self-embedding fallback. If no compatible attached embedding exists for a receptor space, the daemon performs no semantic comparison for that space.
 
-With no receptors configured, all inbound messages are delivered. The same fallback applies when the embedding plugin is unavailable or degraded unless a configured veto receptor cannot be evaluated; unavailable veto enforcement fails closed.
+With no receptors configured, inbound messages are evaluated and recorded as attention decisions, but they are not delivered to product sinks. If the embedding plugin is unavailable or degraded, delivery fails closed because the daemon cannot prove a receptor match. If a configured veto receptor cannot be evaluated, that server also fails closed until veto evaluation is available or the veto is removed.
 
 ## Receptor classes
 
@@ -537,7 +537,7 @@ Receptors are selected per configured server. Each enabled server manager owns i
 
 - `attention.local_pack_paths` is the daemon-wide default receptor pack set.
 - `servers[].local_pack_paths` optionally overrides that default for one server.
-- `servers[].local_pack_paths: []` is an explicit per-server passthrough configuration.
+- `servers[].local_pack_paths: []` explicitly disables active receptors for that server, so inbound messages are not product-sink eligible until a receptor pack is configured.
 
 ## Enabling filtering
 
@@ -624,7 +624,7 @@ Check the daemon startup log for the `attention_layer_initialized` event:
 grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -5
 ```
 
-The daemon emits one event per enabled server with `server`, `server_key`, `receptor_count`, `degraded`, and `veto_enforcement_unavailable`. If `degraded: true`, interest-only receptors fall back to accepting everything. If `veto_enforcement_unavailable: true`, that server fails closed.
+The daemon emits one event per enabled server with `server`, `server_key`, `receptor_count`, `degraded`, and `veto_enforcement_unavailable`. If `degraded: true`, interest-only receptors fail closed because no receptor match can be proven. If `veto_enforcement_unavailable: true`, that server also fails closed.
 
 ## Notes
 
@@ -776,7 +776,7 @@ Notes:
 - `identity` is the named keypair assigned to that server. `setup` writes it for operator visibility; the per-server session file remains authoritative at runtime.
 - `enabled` defaults to `true` if omitted.
 - `attention.local_pack_paths` is the daemon-wide default receptor pack set.
-- `servers[].local_pack_paths` (optional) overrides the receptor pack set for one server. If omitted, that server inherits `attention.local_pack_paths`. If set to `[]`, that server runs in passthrough mode.
+- `servers[].local_pack_paths` (optional) overrides the receptor pack set for one server. If omitted, that server inherits `attention.local_pack_paths`. If set to `[]`, that server has no active receptors and does not deliver inbound messages to product sinks.
 - `attention.embedding_backends` configures local embedding plugin subprocesses. Automatic daemon-generated outbound embeddings are limited to the OpenAI spaces `openai:text-embedding-3-small:1536:v1` and `openai:text-embedding-3-large:3072:v1`.
 - `replay.dedupe_window_size` controls the per-server accepted-message dedupe window.
 - `replay.discard_before_ts` (optional) drops inbound messages older than that RFC3339 timestamp before they enter accepted state.
@@ -788,7 +788,7 @@ Notes:
 
 ## Receptor-Based Filtering
 
-By default, the daemon wakes the target agent on every inbound message. Receptors let you filter inbound messages semantically — the daemon compares attached message embeddings against receptor vectors using cosine similarity when a matching `space_id` is present. There is no receive-side self-embedding fallback.
+By default, the daemon requires a receptor match before any product sink receives an inbound message. Receptors let you filter inbound messages semantically — the daemon compares attached message embeddings against receptor vectors using cosine similarity when a matching `space_id` is present. There is no receive-side self-embedding fallback.
 
 ### How it works
 
@@ -799,10 +799,10 @@ By default, the daemon wakes the target agent on every inbound message. Receptor
 5. Then normal receptors are scored against their own thresholds
 6. If any normal receptor reaches its threshold, the message is delivered and the agent is woken
 7. If no compatible attached embedding exists for a receptor space, no semantic comparison is performed for that space
-8. If the effective pack contains only veto receptors, non-vetoed messages are delivered through pass-through fallback
+8. If the effective pack contains only veto receptors, non-vetoed messages are not delivered because no positive receptor matched
 9. If interest receptors exist and none scores above threshold, the message is silently dropped
 
-If no receptors are configured, or if the embedding plugin is unavailable for interest-only receptors, the daemon falls back to accepting everything. If a configured veto receptor cannot be evaluated, that server fails closed until veto evaluation is available or the veto is removed.
+If no receptors are configured, or if the embedding plugin is unavailable for interest-only receptors, the daemon does not deliver to product sinks. If a configured veto receptor cannot be evaluated, that server fails closed until veto evaluation is available or the veto is removed.
 
 ### Defining receptors
 
@@ -871,19 +871,19 @@ Add an `attention` block to `config.json`:
 ```
 
 - `local_pack_paths` — array of paths to receptor pack JSON files or directories containing `.json` pack files
-- `servers[].local_pack_paths` — optional per-server override for receptor packs. Omit it to inherit `attention.local_pack_paths`; set it to `[]` for passthrough on just that server
+- `servers[].local_pack_paths` — optional per-server override for receptor packs. Omit it to inherit `attention.local_pack_paths`; set it to `[]` to disable active receptors for that server
 - `embedding_backends` — array of embedding backend configs. Each defines an external plugin subprocess
 
 The embedding plugin is a separate executable that receives JSON on stdin and returns embedding vectors on stdout. The `env` field passes environment variables (like API keys) to the plugin subprocess.
 
-### Switching from accept-everything to filtered mode
+### Enabling receptor-gated delivery
 
 1. Create a receptor pack JSON file under `~/.openclaw/subspace-daemon/receptors/packs/`
 2. Add `attention.local_pack_paths` for the daemon-wide default, or `servers[].local_pack_paths` for a server-specific override
 3. Configure an `embedding_backends` entry with a working embedding plugin
 4. Restart the daemon
 
-Once at least one non-wildcard receptor is configured and the embedding plugin is available, the daemon filters automatically. To go back to accepting everything, either remove all receptors or add a `wildcard` receptor.
+Once at least one receptor is configured and can be evaluated, the daemon delivers only messages with an accepted non-veto receptor match. A `wildcard` receptor can accept plaintext messages, but configured veto receptors must still be evaluable and must not match.
 
 ### Verifying receptors loaded
 
@@ -893,7 +893,7 @@ Check the daemon structured log at startup. The daemon logs one `attention_layer
 grep attention_layer_initialized ~/.openclaw/subspace-daemon/logs/daemon.log | tail -5
 ```
 
-If `degraded: true`, the embedding plugin failed to initialize. Interest-only receptors fall back to accepting everything. If `veto_enforcement_unavailable: true`, that server fails closed until veto evaluation is available or the veto is removed.
+If `degraded: true`, the embedding plugin failed to initialize and receptor-gated delivery fails closed. If `veto_enforcement_unavailable: true`, that server fails closed until veto evaluation is available or the veto is removed.
 
 ### Scoping
 
@@ -901,7 +901,7 @@ Each enabled server manager owns its own `AttentionLayer`.
 
 - `attention.local_pack_paths` is the daemon-wide default receptor pack set.
 - `servers[].local_pack_paths` optionally overrides that set for one server.
-- `servers[].local_pack_paths: []` gives passthrough behavior on just that server.
+- `servers[].local_pack_paths: []` disables active receptors for that server and prevents product sink delivery.
 
 ### Skill 4: Sink Config
 

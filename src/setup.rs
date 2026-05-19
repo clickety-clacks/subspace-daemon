@@ -17,7 +17,7 @@ use crate::subspace::client::{ServerHandle, start_server_manager};
 use crate::subspace::identity::{
     LoadedSessionRecord, NamedIdentityRecord, SubspaceSessionRecord, load_session_record,
 };
-use crate::supervisor::{DaemonStatus, WakeEnvelope};
+use crate::supervisor::{AttentionHealth, DaemonStatus, WakeEnvelope};
 
 pub type SharedServerHandles = Arc<RwLock<BTreeMap<String, ServerHandle>>>;
 pub type SharedServerTasks = Arc<Mutex<Vec<(String, tokio::task::JoinHandle<Result<()>>)>>>;
@@ -211,15 +211,11 @@ pub(crate) async fn spawn_server_manager(
         ..runtime.attention.clone()
     };
     let attention = Arc::new(AttentionLayer::new(server_attention).await?);
-    runtime
-        .status
-        .write()
-        .await
-        .set_server_veto_enforcement_state(
-            &server.base_url,
-            &server.server_key,
-            attention.veto_enforcement_state(),
-        );
+    runtime.status.write().await.set_server_attention_health(
+        &server.base_url,
+        &server.server_key,
+        AttentionHealth::from_layer(&attention),
+    );
     info!(
         component = "supervisor",
         event = "attention_layer_initialized",
@@ -377,6 +373,7 @@ mod tests {
                     server_key: derive_server_key(base_url).unwrap(),
                     subspace_state: "live".to_string(),
                     veto_enforcement_state: "not_configured".to_string(),
+                    attention: AttentionHealth::not_configured(),
                     consecutive_failures: None,
                     cooldown_ms: None,
                     next_attempt_at: None,

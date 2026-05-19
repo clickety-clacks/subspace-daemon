@@ -22,11 +22,22 @@ use crate::state_lock::StateLock;
 use crate::storage::{DeliveryStore, RoutingSnapshot, SinkRoutingEntry, SinkSnapshot};
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AttentionHealth {
+    pub receptor_count: usize,
+    pub interest_receptor_count: usize,
+    pub veto_receptor_count: usize,
+    pub wildcard_receptor_count: usize,
+    pub delivery_mode: String,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ServerHealth {
     pub server: String,
     pub server_key: String,
     pub subspace_state: String,
     pub veto_enforcement_state: String,
+    pub attention: AttentionHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consecutive_failures: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +69,7 @@ impl DaemonStatus {
                         server_key: server.server_key.clone(),
                         subspace_state: "connecting".to_string(),
                         veto_enforcement_state: "not_configured".to_string(),
+                        attention: AttentionHealth::not_configured(),
                         consecutive_failures: None,
                         cooldown_ms: None,
                         next_attempt_at: None,
@@ -93,6 +105,11 @@ impl DaemonStatus {
             .get(base_url)
             .map(|server| server.veto_enforcement_state.clone())
             .unwrap_or_else(|| "not_configured".to_string());
+        let attention = self
+            .servers
+            .get(base_url)
+            .map(|server| server.attention.clone())
+            .unwrap_or_else(AttentionHealth::not_configured);
         self.servers.insert(
             base_url.to_string(),
             ServerHealth {
@@ -100,6 +117,7 @@ impl DaemonStatus {
                 server_key: server_key.to_string(),
                 subspace_state: value.into(),
                 veto_enforcement_state,
+                attention,
                 consecutive_failures: None,
                 cooldown_ms: None,
                 next_attempt_at: None,
@@ -122,6 +140,11 @@ impl DaemonStatus {
             .get(base_url)
             .map(|server| server.veto_enforcement_state.clone())
             .unwrap_or_else(|| "not_configured".to_string());
+        let attention = self
+            .servers
+            .get(base_url)
+            .map(|server| server.attention.clone())
+            .unwrap_or_else(AttentionHealth::not_configured);
         self.servers.insert(
             base_url.to_string(),
             ServerHealth {
@@ -129,6 +152,7 @@ impl DaemonStatus {
                 server_key: server_key.to_string(),
                 subspace_state: "reconnect_cooldown".to_string(),
                 veto_enforcement_state,
+                attention,
                 consecutive_failures: Some(consecutive_failures),
                 cooldown_ms: Some(cooldown_ms),
                 next_attempt_at: Some(next_attempt_at),
@@ -157,6 +181,36 @@ impl DaemonStatus {
                 server_key: server_key.to_string(),
                 subspace_state: "connecting".to_string(),
                 veto_enforcement_state: state,
+                attention: AttentionHealth::not_configured(),
+                consecutive_failures: None,
+                cooldown_ms: None,
+                next_attempt_at: None,
+                last_error_kind: None,
+            },
+        );
+    }
+
+    pub fn set_server_attention_health(
+        &mut self,
+        base_url: &str,
+        server_key: &str,
+        attention: AttentionHealth,
+    ) {
+        if let Some(server) = self.servers.get_mut(base_url) {
+            server.server_key = server_key.to_string();
+            server.veto_enforcement_state = attention.veto_enforcement_state().to_string();
+            server.attention = attention;
+            return;
+        }
+
+        self.servers.insert(
+            base_url.to_string(),
+            ServerHealth {
+                server: base_url.to_string(),
+                server_key: server_key.to_string(),
+                subspace_state: "connecting".to_string(),
+                veto_enforcement_state: attention.veto_enforcement_state().to_string(),
+                attention,
                 consecutive_failures: None,
                 cooldown_ms: None,
                 next_attempt_at: None,
@@ -173,6 +227,40 @@ impl DaemonStatus {
 
     pub fn servers_snapshot(&self) -> Vec<ServerHealth> {
         self.servers.values().cloned().collect()
+    }
+}
+
+impl AttentionHealth {
+    pub fn from_layer(layer: &AttentionLayer) -> Self {
+        Self {
+            receptor_count: layer.receptor_count(),
+            interest_receptor_count: layer.interest_receptor_count(),
+            veto_receptor_count: layer.veto_receptor_count(),
+            wildcard_receptor_count: layer.wildcard_receptor_count(),
+            delivery_mode: layer.delivery_mode().to_string(),
+            degraded: layer.is_degraded(),
+        }
+    }
+
+    pub fn not_configured() -> Self {
+        Self {
+            receptor_count: 0,
+            interest_receptor_count: 0,
+            veto_receptor_count: 0,
+            wildcard_receptor_count: 0,
+            delivery_mode: "no_active_receptors".to_string(),
+            degraded: false,
+        }
+    }
+
+    pub fn veto_enforcement_state(&self) -> &'static str {
+        if self.delivery_mode == "veto_enforcement_unavailable" {
+            "unavailable"
+        } else if self.veto_receptor_count > 0 {
+            "ready"
+        } else {
+            "not_configured"
+        }
     }
 }
 
@@ -410,6 +498,10 @@ async fn process_wake_queue(
             );
         }
 
+        if let Some(store) = delivery_store.as_ref() {
+            store.record_attention_decision(&item, &attention_result)?;
+        }
+
         if !attention_result.deliver {
             match attention_result.disposition {
                 AttentionDisposition::Vetoed => {
@@ -444,12 +536,16 @@ async fn process_wake_queue(
                         "message filtered because veto enforcement is unavailable"
                     );
                 }
-                AttentionDisposition::Filtered | AttentionDisposition::Deliver => {
+                AttentionDisposition::Filtered
+                | AttentionDisposition::NoActiveReceptor
+                | AttentionDisposition::EvaluationUnavailable
+                | AttentionDisposition::Deliver => {
                     info!(
                         component = "wake_router",
                         event = "message_filtered",
                         message_id = %item.message_id,
                         server = %item.server,
+                        disposition = ?attention_result.disposition,
                         top_score = attention_result.matches.first().map(|m| m.score),
                         "message filtered by attention layer"
                     );
@@ -708,6 +804,7 @@ mod tests {
                     server_key: "https_subspace_example_443".to_string(),
                     subspace_state: "reconnect_cooldown".to_string(),
                     veto_enforcement_state: "not_configured".to_string(),
+                    attention: AttentionHealth::not_configured(),
                     consecutive_failures: Some(10),
                     cooldown_ms: Some(300_000),
                     next_attempt_at: Some("2026-04-17T12:05:00Z".to_string()),

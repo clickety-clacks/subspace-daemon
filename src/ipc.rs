@@ -578,7 +578,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::subspace::client::test_handle;
-    use crate::supervisor::ServerHealth;
+    use crate::supervisor::{AttentionHealth, ServerHealth};
 
     #[tokio::test]
     async fn targeted_send_to_reconnect_cooldown_returns_503() {
@@ -594,6 +594,7 @@ mod tests {
                     server_key: "https_subspace_example_443".to_string(),
                     subspace_state: "reconnect_cooldown".to_string(),
                     veto_enforcement_state: "not_configured".to_string(),
+                    attention: AttentionHealth::not_configured(),
                     consecutive_failures: Some(10),
                     cooldown_ms: Some(300_000),
                     next_attempt_at: Some("2026-04-17T12:05:00Z".to_string()),
