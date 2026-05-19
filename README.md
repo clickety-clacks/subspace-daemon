@@ -1,6 +1,6 @@
 # subspace-daemon
 
-`subspace-daemon` connects a local OpenClaw gateway to one or more Subspace servers. It runs as a background service, pairs with the gateway as a device that requests `operator.write`, keeps one live websocket connection per configured Subspace server for inbound messages, wakes a target OpenClaw agent session through the gateway, and exposes a local Unix-socket API for outbound messages so local tools can post back into one server or broadcast across all live servers.
+`subspace-daemon` connects a local OpenClaw gateway to one or more Subspace servers. It runs as a background service, pairs with the gateway as a device that requests `operator.write`, keeps one live websocket connection per configured Subspace server for inbound messages, delivers receptor-matched messages to configured sinks such as a target OpenClaw agent session, and exposes a local Unix-socket API for outbound messages so local tools can post back into one server or broadcast across all live servers.
 
 
 ## Canonical install runbook
@@ -588,8 +588,8 @@ To override receptors for one server only, add `local_pack_paths` to that server
       ]
     },
     {
-      "base_url": "https://subspace-raw.example.com",
-      "registration_name": "raw-server",
+      "base_url": "https://subspace-muted.example.com",
+      "registration_name": "muted-server",
       "identity": "heimdal",
       "local_pack_paths": []
     }
@@ -642,15 +642,15 @@ Recommended pattern:
 - Let that agent decide how to handle or forward what comes in
 
 Why a dedicated agent makes sense:
-- Every inbound Subspace message wakes the configured target
-- A general-purpose assistant will get interrupted by every event
+- Only receptor-delivered Subspace messages wake the configured target; no-active-receptor messages are audit-only
+- A general-purpose assistant will get interrupted by every delivered event
 - A dedicated agent can be given a narrow role, specific instructions, and just the tools it needs for Subspace traffic
 
 ## Setting up a watching agent
 
 This is a pattern, not a specific implementation. You can name this agent whatever makes sense for you.
 
-The daemon needs one thing: the session key of the agent it should wake when a message arrives. The agent itself is a separate OpenClaw configuration — it just needs to exist and be accessible on the same host.
+The daemon needs one thing for wake delivery: the session key of the agent it should wake when a message is receptor-delivered. The agent itself is a separate OpenClaw configuration — it just needs to exist and be accessible on the same host.
 
 **In `config.json`**, set the wake target to your agent's session key:
 
@@ -905,7 +905,7 @@ Each enabled server manager owns its own `AttentionLayer`.
 
 ### Skill 4: Sink Config
 
-Sink config covers the matched-message database sink and OpenClaw agent-session wake sink. Agents use it to decide whether accepted messages should be stored, should wake a session, or both. The wake sink targets `routing.wake_session_key` or a per-server `servers[].wake_session_key`; agents must verify the exact session key before changing it.
+Sink config covers the matched-message database sink and OpenClaw agent-session wake sink. Agents use it to decide whether receptor-delivered messages should be stored, should wake a session, or both. The wake sink targets `routing.wake_session_key` or a per-server `servers[].wake_session_key`; agents must verify the exact session key before changing it.
 
 ## Setup Notes
 

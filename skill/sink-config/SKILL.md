@@ -1,21 +1,21 @@
 # Subspace Sink Configuration
 
-Configure where accepted inbound Subspace messages go after receptor policy matches them.
+Configure where receptor-delivered inbound Subspace messages go after receptor policy matches them.
 
 ## Product Model
 
-A receptor match means the daemon accepted an inbound message for routing. A sink is the configured destination/action for that accepted message.
+A receptor match means the daemon accepted an inbound message for product delivery. A sink is the configured destination/action for that receptor-delivered message.
 
 Initial sink classes:
 
-- `db` — store the accepted message/event, source identity, receptor-match metadata, provenance/artifacts, idempotency bookkeeping, and delivery audit.
-- `agent_session_wake` — wake an OpenClaw agent session with the accepted message context.
+- `db` — store the receptor-delivered message/event, source identity, receptor-match metadata, provenance/artifacts, idempotency bookkeeping, and delivery audit.
+- `agent_session_wake` — wake an OpenClaw agent session with the receptor-delivered message context.
 
 ## Default Install Shape
 
 For a normal personal daemon install, configure both sinks:
 
-1. `db` so accepted messages are durable and replay/audit-safe.
+1. `db` so receptor-delivered messages are durable and replay/audit-safe.
 2. `agent_session_wake` so the right agent is notified when a message passes receptor policy.
 
 Do not configure sink behavior by adding ad-hoc scripts around the daemon. Use daemon config and daemon-owned migrations.
@@ -24,8 +24,8 @@ Do not configure sink behavior by adding ad-hoc scripts around the daemon. Use d
 
 Use this decision rule:
 
-- If accepted messages must be durable, searchable, replay-safe, or auditable: enable `db`.
-- If accepted messages should wake an OpenClaw session: enable `agent_session_wake`.
+- If receptor-delivered messages must be durable, searchable, replay-safe, or auditable: enable `db`.
+- If receptor-delivered messages should wake an OpenClaw session: enable `agent_session_wake`.
 - If both are true: enable both.
 - If the user only wants archival capture with no immediate wakeup: enable `db` only.
 - If the user only wants live wakeups and no local matched-message store: enable `agent_session_wake` only, but call out the loss of replay/audit history before doing it.
@@ -127,8 +127,8 @@ curl --fail --unix-socket ~/.openclaw/subspace-daemon/daemon.sock http://localho
 
 Then send or observe one known matching message and verify:
 
-- DB sink: accepted event/audit row exists once, not duplicated on replay.
-- Wake sink: configured OpenClaw session wakes once for the accepted message id.
+- DB sink: receptor-delivered event/audit row exists once, not duplicated on replay.
+- Wake sink: configured OpenClaw session wakes once for the receptor-delivered message id.
 - Filtered messages do not create delivery work unless explicitly audited as skipped.
 
 ## Do Not
