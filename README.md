@@ -481,7 +481,7 @@ With no receptors configured, inbound messages are evaluated and recorded as att
 | `broad` | Wide topic area. Default class if omitted. |
 | `intersection` | Overlap of two or more topics. |
 | `project` | Messages about a specific active project, repo, or body of work. |
-| `wildcard` | Accept all non-vetoed messages. Does not require embedding after veto evaluation. |
+| `wildcard` | Explicit receptor that accepts messages without its own embedding check only when veto evaluation is either not configured or completed without a veto match. |
 | `veto` | Hard never-deliver policy. Evaluated before normal receptors. |
 
 There is no operator-facing `anti_receptor` class and no per-receptor `negative_examples` field.
@@ -601,11 +601,11 @@ To override receptors for one server only, add `local_pack_paths` to that server
 
 **Accept-all to selective:** Create receptor packs, configure `attention.local_pack_paths` or `servers[].local_pack_paths` in `config.json`, restart.
 
-**Selective to accept-all:** Either remove all non-wildcard receptors, remove the relevant `local_pack_paths`, set one server's `local_pack_paths` to `[]`, or add a `wildcard` receptor (which bypasses embedding for messages on the servers that load it).
+**Selective to wildcard delivery:** Add a `wildcard` receptor for the servers that should receive every message without semantic interest scoring. Removing receptors, removing `local_pack_paths`, or setting one server's `local_pack_paths` to `[]` disables active receptors and prevents product sink delivery until a receptor pack is configured.
 
 ## Using a wildcard receptor
 
-A `wildcard` receptor accepts all non-vetoed messages without an embedding check. If any receptor in any loaded pack has `"class": "wildcard"`, messages are delivered unless a veto receptor matches first.
+A `wildcard` receptor accepts messages without its own embedding check only when veto evaluation is either not configured or completed without a veto match. If any receptor in any loaded pack has `"class": "wildcard"`, messages are delivered unless a configured veto receptor cannot be evaluated or matches first.
 
 ```json
 {
@@ -614,7 +614,7 @@ A `wildcard` receptor accepts all non-vetoed messages without an embedding check
 }
 ```
 
-This is useful during development or when you want to temporarily disable filtering without removing your receptor definitions.
+This is useful during development or when you want explicit receptor-gated delivery without semantic interest scoring.
 
 ## Verifying receptors loaded
 
@@ -795,7 +795,7 @@ By default, the daemon requires a receptor match before any product sink receive
 1. An inbound message arrives over websocket
 2. If the message carries an attached embedding in a known local `space_id`, that vector is compared against compatible veto receptors first
 3. If any veto receptor reaches its threshold, delivery stops
-4. If no veto matches, wildcard receptors can accept the message
+4. If veto evaluation is not configured, or completes without a veto match, wildcard receptors can accept the message
 5. Then normal receptors are scored against their own thresholds
 6. If any normal receptor reaches its threshold, the message is delivered and the agent is woken
 7. If no compatible attached embedding exists for a receptor space, no semantic comparison is performed for that space
@@ -835,13 +835,13 @@ Receptors are defined as JSON files in packs. Each pack contains one or more rec
 
 **Receptor fields:**
 - `receptor_id` (required) — unique identifier across all packs
-- `class` — one of `broad` (wide topic), `intersection` (overlap of topics), `project` (specific project/repo), `wildcard` (accept all, no embedding check), or `veto` (hard never-deliver). Defaults to `broad`
+- `class` — one of `broad` (wide topic), `intersection` (overlap of topics), `project` (specific project/repo), `wildcard` (explicit accept without its own embedding check after veto evaluation), or `veto` (hard never-deliver). Defaults to `broad`
 - `query` — content-language query for non-wildcard receptors
 - `threshold` — cosine similarity threshold for non-wildcard receptors
 - `space_id` — optional local embedding space for non-wildcard receptors; defaults to the enabled backend's `default_space_id`
 
 **Receptor classes:**
-- `wildcard` accepts without its own embedding check after veto evaluation — if present, all non-vetoed messages are delivered
+- `wildcard` accepts without its own embedding check only when veto evaluation is either not configured or completed without a veto match
 - `veto` is evaluated before normal receptors and short-circuits delivery when it reaches threshold
 
 ### Configuring the attention layer

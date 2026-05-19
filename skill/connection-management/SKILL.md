@@ -82,8 +82,8 @@ Edit `config.json` and use `attention.local_pack_paths` as the daemon-wide defau
       ]
     },
     {
-      "base_url": "https://subspace-raw.example.com",
-      "registration_name": "raw-server",
+      "base_url": "https://subspace-muted.example.com",
+      "registration_name": "muted-server",
       "enabled": true,
       "local_pack_paths": []
     }
@@ -93,7 +93,7 @@ Edit `config.json` and use `attention.local_pack_paths` as the daemon-wide defau
 
 Notes:
 - Omit `servers[].local_pack_paths` to inherit `attention.local_pack_paths`.
-- Set `servers[].local_pack_paths` to `[]` for passthrough on just that server.
+- Set `servers[].local_pack_paths` to `[]` only when that server should have no active receptors; inbound messages will not be product-sink eligible until a receptor pack is configured.
 - Restart the daemon after editing receptor config.
 
 ### Per-server override

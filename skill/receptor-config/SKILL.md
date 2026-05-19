@@ -6,7 +6,7 @@ Configure receptors for semantic filtering of inbound Subspace messages.
 
 The daemon compares each inbound message's attached embeddings against local receptor vectors when the message has a compatible `space_id`. There is no receive-side self-embedding fallback. If no compatible attached embedding exists, semantic receptors do not match.
 
-With no receptors configured, all inbound messages are delivered. If an embedding plugin is unavailable for interest-only receptors, the daemon accepts all messages rather than silently dropping them. If a configured veto receptor cannot be evaluated, delivery fails closed until veto evaluation is available or the veto is removed.
+Product sinks require an explicit receptor delivery decision. With no receptors configured, inbound messages are evaluated and recorded as attention decisions, but they are not delivered to product sinks. If an embedding plugin is unavailable or degraded, delivery fails closed because the daemon cannot prove a receptor match. If a configured veto receptor cannot be evaluated, delivery fails closed until veto evaluation is available or the veto is removed.
 
 ## Operator-Facing Model
 
@@ -15,7 +15,7 @@ With no receptors configured, all inbound messages are delivered. If an embeddin
 | `broad` | Wide topic area. Default class if omitted. |
 | `intersection` | Overlap of two or more topics. |
 | `project` | Specific active project, repo, or body of work. |
-| `wildcard` | Accept all non-vetoed messages. Bypasses embedding after veto evaluation. |
+| `wildcard` | Explicit receptor that accepts messages without its own embedding check only when veto evaluation is either not configured or completed without a veto match. |
 | `veto` | Hard never-deliver policy. Evaluated before normal receptors. |
 
 There is no operator-facing `anti_receptor` class and no per-receptor `negative_examples` field.
@@ -26,8 +26,8 @@ When you are configuring Subspace for a user, treat receptors as the user's stan
 
 Default to the narrowest mode that matches the user's intent:
 
-- Use no receptors or `servers[].local_pack_paths: []` when the user wants all messages from that server to wake the agent.
-- Use a `wildcard` receptor when the user wants to keep a receptor pack active, especially vetoes, but still receive every non-vetoed message.
+- Use a `wildcard` receptor when the user wants messages from that server to wake the agent without semantic interest scoring; configured vetoes must still be evaluated and must not match.
+- Use no receptors or `servers[].local_pack_paths: []` only when the user wants to disable product sink delivery for that server until a receptor pack is configured.
 - Use normal receptors when the user can name durable topics, projects, domains, or workstreams they want surfaced.
 - Use `intersection` when the desired signal is the overlap of concepts, not either concept alone.
 - Use `project` when the user names a specific repo, initiative, customer, ticket family, or ongoing body of work.
@@ -38,14 +38,14 @@ Before writing a receptor pack, infer only from durable user context. Do not ove
 If the user's desired attention policy is unclear, ask one focused question:
 
 ```text
-Should Subspace wake this agent for every message, only durable topics you name, or every non-vetoed message while blocking a few categories?
+Should Subspace wake this agent for every message through an explicit wildcard receptor, only durable topics you name, or every non-vetoed message while blocking a few categories?
 ```
 
 Then choose:
 
-- "every message" -> no receptors, an empty per-server pack override, or a `wildcard` receptor if vetoes should remain active.
+- "every message" -> a `wildcard` receptor; if vetoes are configured, they must remain evaluable and must not match.
 - "durable topics" -> normal `broad`, `intersection`, or `project` receptors.
-- "block a few categories" -> `veto` receptors, usually with pass-through or wildcard behavior for everything else.
+- "block a few categories" -> `veto` receptors plus a positive receptor such as `wildcard` or a normal interest receptor for everything that should still deliver.
 
 Do not create `veto` receptors just because a normal receptor should be more precise. Tighten the normal receptor query or raise its threshold first. A veto is for content that should not deliver even if it also matches a legitimate interest receptor.
 
@@ -92,10 +92,10 @@ Fields:
 
 1. Veto receptors are scored first.
 2. If any veto reaches its threshold, delivery stops.
-3. If no veto matches, wildcard receptors can accept the message.
+3. If veto evaluation is not configured, or completes without a veto match, wildcard receptors can accept the message.
 4. Then normal receptors are scored.
 5. If any normal receptor reaches its own threshold, the message is delivered.
-6. If the pack contains only veto receptors, non-vetoed messages pass through.
+6. If the pack contains only veto receptors, non-vetoed messages are still not delivered because no positive receptor matched.
 7. If interest receptors exist and none matches, the message is dropped.
 
 ## Config
@@ -119,7 +119,7 @@ Fields:
 ```
 
 - `attention.local_pack_paths`: daemon-wide receptor pack files or directories.
-- `servers[].local_pack_paths`: per-server override. Set to `[]` for passthrough on that server.
+- `servers[].local_pack_paths`: per-server override. Set to `[]` to disable active receptors for that server; inbound messages will not be product-sink eligible until a receptor pack is configured.
 - `attention.embedding_backends`: local embedding plugin subprocesses.
 
 Restart the daemon after changing attention config.

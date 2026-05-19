@@ -100,7 +100,7 @@ If that veto matches, delivery stops before any normal receptor can match.
 - `broad`: wide topic area.
 - `intersection`: overlap of multiple topics.
 - `project`: specific active project, repo, or body of work.
-- `wildcard`: accept all non-vetoed messages without an embedding check.
+- `wildcard`: explicitly accept messages without its own embedding check only when veto evaluation is either not configured or completed without a veto match.
 - `veto`: hard never-deliver policy, evaluated before normal receptors.
 
 ## Scoping
