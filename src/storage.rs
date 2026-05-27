@@ -11,7 +11,6 @@ use crate::supervisor::WakeEnvelope;
 
 const REQUIRED_TABLES: &[&str] = &[
     "ingress_source",
-    "attention_decision",
     "daemon_event",
     "event_idempotency",
     "receptor_match",
@@ -80,54 +79,6 @@ impl DeliveryStore {
 
     pub fn database_path(&self) -> &Path {
         &self.database_path
-    }
-
-    pub fn record_attention_decision(
-        &self,
-        envelope: &WakeEnvelope,
-        attention: &AttentionResult,
-    ) -> Result<()> {
-        self.with_connection(|conn| {
-            ensure_schema(conn, self.auto_migrate)?;
-            let ingress_source_id =
-                upsert_ingress_source(conn, &envelope.server, &envelope.server_key)?;
-            let evidence_json = attention_evidence_json(attention).to_string();
-            conn.execute(
-                "INSERT INTO attention_decision (
-                    ingress_source_id,
-                    message_id,
-                    message_timestamp,
-                    disposition,
-                    delivery_eligible,
-                    attention_space_id,
-                    attention_fallback,
-                    veto_not_evaluated,
-                    evidence_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ON CONFLICT(ingress_source_id, message_id)
-                DO UPDATE SET
-                    message_timestamp = excluded.message_timestamp,
-                    disposition = excluded.disposition,
-                    delivery_eligible = excluded.delivery_eligible,
-                    attention_space_id = excluded.attention_space_id,
-                    attention_fallback = excluded.attention_fallback,
-                    veto_not_evaluated = excluded.veto_not_evaluated,
-                    evidence_json = excluded.evidence_json,
-                    decided_at = CURRENT_TIMESTAMP",
-                params![
-                    ingress_source_id,
-                    envelope.message_id,
-                    envelope.timestamp,
-                    attention_disposition_str(attention.disposition),
-                    if attention.deliver { 1 } else { 0 },
-                    attention.space_id,
-                    if attention.fallback { 1 } else { 0 },
-                    if attention.veto_not_evaluated { 1 } else { 0 },
-                    evidence_json,
-                ],
-            )?;
-            Ok(())
-        })
     }
 
     pub fn record_db_sink_delivery(
@@ -305,20 +256,6 @@ fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
             server_key TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS attention_decision (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ingress_source_id INTEGER NOT NULL REFERENCES ingress_source(id) ON DELETE RESTRICT,
-            message_id TEXT NOT NULL,
-            message_timestamp TEXT NOT NULL,
-            disposition TEXT NOT NULL,
-            delivery_eligible INTEGER NOT NULL,
-            attention_space_id TEXT,
-            attention_fallback INTEGER NOT NULL,
-            veto_not_evaluated INTEGER NOT NULL,
-            evidence_json TEXT NOT NULL,
-            decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(ingress_source_id, message_id)
-        );
         CREATE TABLE IF NOT EXISTS daemon_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ingress_source_id INTEGER NOT NULL REFERENCES ingress_source(id) ON DELETE RESTRICT,
@@ -397,7 +334,6 @@ fn ensure_schema(conn: &Connection, auto_migrate: bool) -> Result<()> {
             metadata_json TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE INDEX IF NOT EXISTS idx_attention_decision_disposition ON attention_decision(disposition);
         CREATE INDEX IF NOT EXISTS idx_daemon_event_ingress_message ON daemon_event(ingress_source_id, message_id);
         CREATE INDEX IF NOT EXISTS idx_receptor_match_event ON receptor_match(daemon_event_id);
         CREATE INDEX IF NOT EXISTS idx_sink_delivery_event ON sink_delivery(daemon_event_id);
@@ -832,30 +768,6 @@ fn receptor_routing_json(
     })
 }
 
-fn attention_evidence_json(attention: &AttentionResult) -> serde_json::Value {
-    json!({
-        "matches": attention
-            .matches
-            .iter()
-            .map(|matched| {
-                json!({
-                    "receptor_id": matched.receptor_id,
-                    "receptor_class": matched.class.as_str(),
-                    "score": matched.score,
-                    "threshold": matched.threshold,
-                    "above_threshold": matched.above_threshold,
-                })
-            })
-            .collect::<Vec<_>>(),
-        "match_count": attention.matches.len(),
-        "accepted_match_count": attention
-            .matches
-            .iter()
-            .filter(|matched| matched.above_threshold)
-            .count(),
-    })
-}
-
 fn routing_entries_json(entries: &[SinkRoutingEntry]) -> Vec<serde_json::Value> {
     entries
         .iter()
@@ -1089,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn no_active_receptor_records_decision_without_product_sink_rows() {
+    fn no_active_receptor_does_not_create_product_rows() {
         let dir = tempdir().unwrap();
         let store = DeliveryStore::new(&StorageConfig {
             database_path: dir.path().join("daemon.sqlite3"),
@@ -1101,31 +1013,13 @@ mod tests {
         let routing_entries = test_routing();
         let routing = routing_snapshot(&routing_entries);
 
-        store
-            .record_attention_decision(&envelope, &attention)
-            .unwrap();
         let err = store
             .record_db_sink_delivery(&envelope, &attention, &db_sink_config(None), &routing)
             .unwrap_err()
             .to_string();
         assert!(err.contains("sink delivery requires deliver disposition"));
 
-        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
-        let decision: (String, i64, i64, String) = conn
-            .query_row(
-                "SELECT disposition, delivery_eligible, attention_fallback, evidence_json FROM attention_decision",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(decision.0, "no_active_receptor");
-        assert_eq!(decision.1, 0);
-        assert_eq!(decision.2, 1);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&decision.3).unwrap()["match_count"],
-            0
-        );
-        assert_eq!(store.counts().unwrap(), (1, 0, 0, 0, 0, 0, 0));
+        assert_eq!(store.counts().unwrap(), (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[test]
@@ -1149,9 +1043,6 @@ mod tests {
             config_json: json!({"session_key": "agent:test:main"}).to_string(),
         };
 
-        store
-            .record_attention_decision(&filtered_envelope, &filtered_attention())
-            .unwrap();
         let filtered_err = store
             .record_db_sink_delivery(
                 &filtered_envelope,
@@ -1163,9 +1054,6 @@ mod tests {
             .to_string();
         assert!(filtered_err.contains("sink delivery requires deliver disposition"));
 
-        store
-            .record_attention_decision(&vetoed_envelope, &vetoed_attention())
-            .unwrap();
         let vetoed_err = store
             .queue_wake_sink_delivery(
                 &vetoed_envelope,
@@ -1178,19 +1066,7 @@ mod tests {
         assert!(vetoed_err.contains("sink delivery requires deliver disposition"));
 
         let counts = store.counts().unwrap();
-        assert_eq!(counts, (1, 0, 0, 0, 0, 0, 0));
-        let conn = Connection::open(dir.path().join("daemon.sqlite3")).unwrap();
-        let decisions: Vec<String> = conn
-            .prepare("SELECT disposition FROM attention_decision ORDER BY message_id")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect();
-        assert_eq!(
-            decisions,
-            vec!["filtered".to_string(), "vetoed".to_string()]
-        );
+        assert_eq!(counts, (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[test]

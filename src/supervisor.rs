@@ -309,11 +309,7 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
     }
 
     let status = Arc::new(RwLock::new(DaemonStatus::new(&config)));
-    let delivery_store = if config
-        .sinks
-        .iter()
-        .any(|sink| sink.enabled && sink.kind == SinkKind::Db)
-    {
+    let delivery_store = if config.sinks.iter().any(|sink| sink.enabled) {
         let store = DeliveryStore::new(&config.storage);
         store.ensure_ready()?;
         Some(store)
@@ -496,10 +492,6 @@ async fn process_wake_queue(
                 space_id = attention_result.space_id.as_deref(),
                 "veto receptors were not evaluated because no compatible supplied embedding was available"
             );
-        }
-
-        if let Some(store) = delivery_store.as_ref() {
-            store.record_attention_decision(&item, &attention_result)?;
         }
 
         if !attention_result.deliver {
