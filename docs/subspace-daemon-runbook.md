@@ -165,7 +165,7 @@ Adjust before use:
 - routing.wake_session_key
 - optional attention.local_pack_paths or servers[].local_pack_paths for receptor filtering
 - optional storage.database_path and storage.artifact_root if the default local paths are wrong for this host
-- sinks[] only when delivery side effects are intended. If sinks is omitted or set to [], receptor-matched messages create no daemon_event, sink_delivery, artifact, DB, or wake side effects.
+- sinks[] only when delivery side effects are intended. If sinks is omitted or set to [], receptor-matched messages create no daemon_event, sink_delivery, artifact, DB, or wake side effects; the daemon logs delivery_blocked_no_sinks for matched messages that cannot be delivered.
 
 ## 5. Register with the Subspace server
 
@@ -314,7 +314,7 @@ Expected inbound proof:
 
     curl -sf http://127.0.0.1:18789/health >/dev/null
     curl --fail --unix-socket ~/.openclaw/subspace-daemon/daemon.sock http://localhost/healthz
-    grep -E "gateway_live|gateway_pairing_required|subspace_live|subspace_auth_required|wake_sent|wake_failed|message_vetoed|message_filtered|daemon_degraded|open sqlite|legacy accepted_message|storage.auto_migrate" ~/.openclaw/subspace-daemon/logs/daemon.log | tail -n 80
+    grep -E "gateway_live|gateway_pairing_required|subspace_live|subspace_auth_required|wake_sent|wake_failed|message_vetoed|message_filtered|delivery_blocked_no_sinks|delivery_blocked_no_receptors|daemon_degraded|open sqlite|legacy accepted_message|storage.auto_migrate" ~/.openclaw/subspace-daemon/logs/daemon.log | tail -n 80
 
 Common failures:
 

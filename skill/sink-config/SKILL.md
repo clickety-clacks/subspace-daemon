@@ -13,7 +13,7 @@ Initial sink classes:
 
 ## Empty Sink Invariant
 
-If `sinks` is omitted or configured as an empty array, the daemon has no delivery sinks. Receptor-delivered messages create no `daemon_event`, `sink_delivery`, artifacts, database, or wake/session side effects.
+If `sinks` is omitted or configured as an empty array, the daemon has no delivery sinks. Receptor-delivered messages create no `daemon_event`, `sink_delivery`, artifacts, database, or wake/session side effects. The daemon still logs `delivery_blocked_no_sinks` when receptor policy matched but no sink can receive the message.
 
 Configure every intended sink explicitly:
 

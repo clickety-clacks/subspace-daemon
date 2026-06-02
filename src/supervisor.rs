@@ -536,8 +536,17 @@ async fn process_wake_queue(
                         "message filtered because veto enforcement is unavailable"
                     );
                 }
+                AttentionDisposition::NoActiveReceptor => {
+                    warn!(
+                        component = "wake_router",
+                        event = "delivery_blocked_no_receptors",
+                        message_id = %item.message_id,
+                        server = %item.server,
+                        disposition = ?attention_result.disposition,
+                        "message cannot be delivered because no eligible receptors are configured"
+                    );
+                }
                 AttentionDisposition::Filtered
-                | AttentionDisposition::NoActiveReceptor
                 | AttentionDisposition::EvaluationUnavailable
                 | AttentionDisposition::Deliver => {
                     info!(
@@ -552,6 +561,27 @@ async fn process_wake_queue(
                 }
             }
             // Mark as processed so we don't retry
+            let mut runtime = item.runtime.lock().await;
+            runtime.mark_processed(&item.message_id, &item.timestamp);
+            runtime.flush()?;
+            continue;
+        }
+
+        let active_sink_count = enabled_sink_count(&sinks);
+        if active_sink_count == 0 {
+            warn!(
+                component = "wake_router",
+                event = "delivery_blocked_no_sinks",
+                message_id = %item.message_id,
+                server = %item.server,
+                disposition = ?attention_result.disposition,
+                receptor_matches = attention_result
+                    .matches
+                    .iter()
+                    .filter(|receptor_match| receptor_match.above_threshold)
+                    .count(),
+                "message matched receptor policy but cannot be delivered because no sinks are configured"
+            );
             let mut runtime = item.runtime.lock().await;
             runtime.mark_processed(&item.message_id, &item.timestamp);
             runtime.flush()?;
@@ -741,6 +771,10 @@ fn routing_entries_for_sinks(
         .collect()
 }
 
+fn enabled_sink_count(sinks: &[SinkConfig]) -> usize {
+    sinks.iter().filter(|sink| sink.enabled).count()
+}
+
 fn routing_entry_for_sink(
     sink: &SinkConfig,
     wake_session_key_override: Option<&str>,
@@ -858,6 +892,29 @@ mod tests {
                 .unwrap()
                 .veto_enforcement_state,
             "unavailable"
+        );
+    }
+
+    #[test]
+    fn enabled_sink_count_treats_empty_and_disabled_sinks_as_no_delivery_targets() {
+        assert_eq!(enabled_sink_count(&[]), 0);
+        assert_eq!(
+            enabled_sink_count(&[SinkConfig {
+                key: "db".to_string(),
+                kind: SinkKind::Db,
+                enabled: false,
+                destination: None,
+            }]),
+            0
+        );
+        assert_eq!(
+            enabled_sink_count(&[SinkConfig {
+                key: "db".to_string(),
+                kind: SinkKind::Db,
+                enabled: true,
+                destination: None,
+            }]),
+            1
         );
     }
 }

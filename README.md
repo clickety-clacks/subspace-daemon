@@ -472,7 +472,7 @@ How to configure receptors for semantic filtering of inbound Subspace messages.
 
 Receptors are semantic filters. The daemon compares each inbound message's attached embeddings against receptor vectors when a known local `space_id` is present. There is no receive-side self-embedding fallback. If no compatible attached embedding exists for a receptor space, the daemon performs no semantic comparison for that space.
 
-With no receptors configured, inbound messages are evaluated and recorded as attention decisions, but they are not delivered to product sinks. If the embedding plugin is unavailable or degraded, delivery fails closed because the daemon cannot prove a receptor match. If a configured veto receptor cannot be evaluated, that server also fails closed until veto evaluation is available or the veto is removed.
+With no receptors configured, inbound messages are evaluated, recorded as attention decisions only when a DB sink is configured, and not delivered to product sinks. The daemon logs `delivery_blocked_no_receptors` for that configuration. If the embedding plugin is unavailable or degraded, delivery fails closed because the daemon cannot prove a receptor match. If a configured veto receptor cannot be evaluated, that server also fails closed until veto evaluation is available or the veto is removed.
 
 ## Receptor classes
 
@@ -802,7 +802,7 @@ By default, the daemon requires a receptor match before any product sink receive
 8. If the effective pack contains only veto receptors, non-vetoed messages are not delivered because no positive receptor matched
 9. If interest receptors exist and none scores above threshold, the message is silently dropped
 
-If no receptors are configured, or if the embedding plugin is unavailable for interest-only receptors, the daemon does not deliver to product sinks. If a configured veto receptor cannot be evaluated, that server fails closed until veto evaluation is available or the veto is removed.
+If no receptors are configured, or if the embedding plugin is unavailable for interest-only receptors, the daemon does not deliver to product sinks. For the no-receptor case, the daemon logs `delivery_blocked_no_receptors` so operators can see that delivery is impossible by configuration. If a configured veto receptor cannot be evaluated, that server fails closed until veto evaluation is available or the veto is removed.
 
 ### Defining receptors
 
@@ -905,7 +905,7 @@ Each enabled server manager owns its own `AttentionLayer`.
 
 ### Skill 4: Sink Config
 
-Sink config covers the matched-message database sink and OpenClaw agent-session wake sink. Agents use it to decide whether receptor-delivered messages should be stored, should wake a session, or both. If `sinks` is omitted or set to `[]`, receptor-delivered messages create no `daemon_event`, no `sink_delivery`, no artifacts, and no DB or wake/session side effects. Configure a `db` sink explicitly for archival capture, and configure an `agent_session_wake` sink explicitly when a wake should be sent. The wake sink targets `routing.wake_session_key` or a per-server `servers[].wake_session_key`; agents must verify the exact session key before changing it.
+Sink config covers the matched-message database sink and OpenClaw agent-session wake sink. Agents use it to decide whether receptor-delivered messages should be stored, should wake a session, or both. If `sinks` is omitted or set to `[]`, receptor-delivered messages create no `daemon_event`, no `sink_delivery`, no artifacts, and no DB or wake/session side effects; the daemon logs `delivery_blocked_no_sinks` when receptor policy matched but no sink can receive the message. Configure a `db` sink explicitly for archival capture, and configure an `agent_session_wake` sink explicitly when a wake should be sent. The wake sink targets `routing.wake_session_key` or a per-server `servers[].wake_session_key`; agents must verify the exact session key before changing it.
 
 ## Setup Notes
 

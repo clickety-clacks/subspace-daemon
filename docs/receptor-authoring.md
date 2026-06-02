@@ -4,7 +4,7 @@ This guide explains the operator-facing attention model for inbound Subspace mes
 
 The daemon compares sender-attached message embeddings against local receptor vectors when the message carries a compatible `space_id`. There is no receive-side self-embedding fallback. If no compatible attached embedding exists, semantic receptors do not match.
 
-With no receptors configured, the daemon records an attention decision but does not deliver to product sinks. A `wildcard` receptor delivers every message only when veto evaluation is either not configured or completed without a veto match.
+With no receptors configured, the daemon records an attention decision when a DB sink is configured, logs `delivery_blocked_no_receptors`, and does not deliver to product sinks. A `wildcard` receptor delivers every message only when veto evaluation is either not configured or completed without a veto match.
 
 ## Model
 

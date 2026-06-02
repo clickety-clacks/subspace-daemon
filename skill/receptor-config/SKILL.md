@@ -6,7 +6,7 @@ Configure receptors for semantic filtering of inbound Subspace messages.
 
 The daemon compares each inbound message's attached embeddings against local receptor vectors when the message has a compatible `space_id`. There is no receive-side self-embedding fallback. If no compatible attached embedding exists, semantic receptors do not match.
 
-Product sinks require an explicit receptor delivery decision. With no receptors configured, inbound messages are evaluated and recorded as attention decisions, but they are not delivered to product sinks. If an embedding plugin is unavailable or degraded, delivery fails closed because the daemon cannot prove a receptor match. If a configured veto receptor cannot be evaluated, delivery fails closed until veto evaluation is available or the veto is removed.
+Product sinks require an explicit receptor delivery decision. With no receptors configured, inbound messages are evaluated, recorded as attention decisions only when a DB sink is configured, and not delivered to product sinks. The daemon logs `delivery_blocked_no_receptors` for that configuration. If an embedding plugin is unavailable or degraded, delivery fails closed because the daemon cannot prove a receptor match. If a configured veto receptor cannot be evaluated, delivery fails closed until veto evaluation is available or the veto is removed.
 
 ## Operator-Facing Model
 
