@@ -905,7 +905,7 @@ Each enabled server manager owns its own `AttentionLayer`.
 
 ### Skill 4: Sink Config
 
-Sink config covers the matched-message database sink and OpenClaw agent-session wake sink. Agents use it to decide whether receptor-delivered messages should be stored, should wake a session, or both. The wake sink targets `routing.wake_session_key` or a per-server `servers[].wake_session_key`; agents must verify the exact session key before changing it.
+Sink config covers the matched-message database sink and OpenClaw agent-session wake sink. Agents use it to decide whether receptor-delivered messages should be stored, should wake a session, or both. If `sinks` is omitted or set to `[]`, receptor-delivered messages create no `daemon_event`, no `sink_delivery`, no artifacts, and no DB or wake/session side effects. Configure a `db` sink explicitly for archival capture, and configure an `agent_session_wake` sink explicitly when a wake should be sent. The wake sink targets `routing.wake_session_key` or a per-server `servers[].wake_session_key`; agents must verify the exact session key before changing it.
 
 ## Setup Notes
 

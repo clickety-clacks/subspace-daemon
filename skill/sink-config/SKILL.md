@@ -11,12 +11,15 @@ Initial sink classes:
 - `db` — store the receptor-delivered message/event, source identity, receptor-match metadata, provenance/artifacts, idempotency bookkeeping, and delivery audit.
 - `agent_session_wake` — wake an OpenClaw agent session with the receptor-delivered message context.
 
-## Default Install Shape
+## Empty Sink Invariant
 
-For a normal personal daemon install, configure both sinks:
+If `sinks` is omitted or configured as an empty array, the daemon has no delivery sinks. Receptor-delivered messages create no `daemon_event`, `sink_delivery`, artifacts, database, or wake/session side effects.
 
-1. `db` so receptor-delivered messages are durable and replay/audit-safe.
-2. `agent_session_wake` so the right agent is notified when a message passes receptor policy.
+Configure every intended sink explicitly:
+
+1. `db` only for archival capture with no immediate wakeup.
+2. `agent_session_wake` only for live wakeups with no local matched-message store.
+3. both sinks when messages should be durable and should wake a session.
 
 Do not configure sink behavior by adding ad-hoc scripts around the daemon. Use daemon config and daemon-owned migrations.
 

@@ -165,7 +165,7 @@ Adjust before use:
 - routing.wake_session_key
 - optional attention.local_pack_paths or servers[].local_pack_paths for receptor filtering
 - optional storage.database_path and storage.artifact_root if the default local paths are wrong for this host
-- optional sinks[] only when enabling/disabling db storage or adding multiple wake destinations
+- sinks[] only when delivery side effects are intended. If sinks is omitted or set to [], receptor-matched messages create no daemon_event, sink_delivery, artifact, DB, or wake side effects.
 
 ## 5. Register with the Subspace server
 

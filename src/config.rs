@@ -149,8 +149,8 @@ pub struct StoredConfig {
     pub retry: StoredRetryConfig,
     #[serde(default)]
     pub storage: StoredStorageConfig,
-    #[serde(default)]
-    pub sinks: Vec<StoredSinkConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sinks: Option<Vec<StoredSinkConfig>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -273,7 +273,7 @@ impl Default for StoredConfig {
             logging: StoredLoggingConfig::default(),
             retry: StoredRetryConfig::default(),
             storage: StoredStorageConfig::default(),
-            sinks: vec![],
+            sinks: None,
         }
     }
 }
@@ -424,30 +424,17 @@ impl Config {
                     .unwrap_or_else(default_artifact_root),
                 auto_migrate: stored.storage.auto_migrate.unwrap_or(true),
             },
-            sinks: normalize_sinks(&stored.sinks)?,
+            sinks: normalize_sinks(stored.sinks.as_deref())?,
             paths,
         })
     }
 }
 
-fn normalize_sinks(stored: &[StoredSinkConfig]) -> Result<Vec<SinkConfig>> {
-    let raw = if stored.is_empty() {
-        default_sinks()
-            .into_iter()
-            .map(|sink| StoredSinkConfig {
-                key: Some(sink.key),
-                kind: sink.kind.as_str().to_string(),
-                enabled: Some(sink.enabled),
-                destination: sink.destination,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        stored.to_vec()
-    };
-
+fn normalize_sinks(stored: Option<&[StoredSinkConfig]>) -> Result<Vec<SinkConfig>> {
+    let raw = stored.unwrap_or(&[]);
     let mut seen = BTreeSet::new();
     let mut sinks = Vec::with_capacity(raw.len());
-    for sink in raw {
+    for sink in raw.iter().cloned() {
         let kind = SinkKind::parse(&sink.kind)?;
         let key = sink
             .key
@@ -471,23 +458,6 @@ fn normalize_sinks(stored: &[StoredSinkConfig]) -> Result<Vec<SinkConfig>> {
         });
     }
     Ok(sinks)
-}
-
-fn default_sinks() -> Vec<SinkConfig> {
-    vec![
-        SinkConfig {
-            key: SinkKind::Db.default_key().to_string(),
-            kind: SinkKind::Db,
-            enabled: true,
-            destination: None,
-        },
-        SinkConfig {
-            key: SinkKind::AgentSessionWake.default_key().to_string(),
-            kind: SinkKind::AgentSessionWake,
-            enabled: true,
-            destination: None,
-        },
-    ]
 }
 
 impl SinkKind {
@@ -1060,16 +1030,36 @@ mod tests {
     }
 
     #[test]
-    fn defaults_enable_db_and_wake_sinks() {
+    fn omitted_sinks_configures_no_delivery_sinks() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.json");
         fs::write(&config_path, r#"{}"#).unwrap();
 
         let config = Config::load(config_path).unwrap();
-        assert_eq!(config.sinks.len(), 2);
+        assert!(config.sinks.is_empty());
+    }
+
+    #[test]
+    fn empty_sinks_configures_no_delivery_sinks() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(&config_path, r#"{ "sinks": [] }"#).unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert!(config.sinks.is_empty());
+    }
+
+    #[test]
+    fn explicit_db_only_sink_loads_without_wake_sink() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(&config_path, r#"{ "sinks": [{ "kind": "db" }] }"#).unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.sinks.len(), 1);
+        assert_eq!(config.sinks[0].key, "db");
         assert_eq!(config.sinks[0].kind, SinkKind::Db);
-        assert_eq!(config.sinks[1].kind, SinkKind::AgentSessionWake);
-        assert!(config.sinks.iter().all(|sink| sink.enabled));
+        assert!(config.sinks[0].enabled);
     }
 
     #[test]
