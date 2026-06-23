@@ -176,7 +176,7 @@ def classify(
         return False, "argus_not_publishing"
     if daemon_match is None:
         return False, "swarm_to_daemon_stale"
-    if daemon_match.event_time is None or daemon_match.event_time < argus.event_time:
+    if daemon_match.event_time is None:
         return False, "swarm_to_daemon_stale"
     if now - daemon_match.event_time > freshness_window:
         return False, "swarm_to_daemon_stale"

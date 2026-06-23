@@ -77,6 +77,23 @@ class NewsPipelineFreshnessMonitorTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(root, "healthy")
 
+
+    def test_exact_message_match_allows_daemon_acceptance_before_publish_completion(self):
+        argus = monitor.PublishAttempt("2026-06-23T05:06:23Z", "2026-06-23T05:06:25Z", "succeeded", "m1")
+        daemon = monitor.DaemonEvent(8, "m1", "2026-06-23T05:06:23.514408Z", "2026-06-23 05:06:23")
+        ok, root = monitor.classify(
+            datetime(2026, 6, 23, 5, 7, tzinfo=UTC),
+            argus,
+            daemon,
+            daemon,
+            {"ok": True, "gateway_state": "live", "servers": [{"server_key": "https_subspace_swarm_channel_443", "subspace_state": "live"}]},
+            timedelta(hours=24),
+            timedelta(hours=3),
+            "https_subspace_swarm_channel_443",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(root, "healthy")
+
     def test_classifies_unhealthy_daemon_health_as_runtime_down(self):
         argus = monitor.PublishAttempt("2026-06-23T10:00:00Z", "2026-06-23T10:01:00Z", "succeeded", "m1")
         daemon = monitor.DaemonEvent(8, "m1", "2026-06-23T10:01:05Z", "2026-06-23 10:01:05")
