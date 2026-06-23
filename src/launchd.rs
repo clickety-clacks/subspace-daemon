@@ -21,6 +21,15 @@ pub fn render_launchd_plist(binary_path: &Path, config_path: &Path, home: &Path)
     <true/>
     <key>WorkingDirectory</key>
     <string>{}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HOME</key>
+      <string>{}</string>
+      <key>USER</key>
+      <string>{}</string>
+      <key>PATH</key>
+      <string>{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>{}/.openclaw/subspace-daemon/logs/stdout.log</string>
     <key>StandardErrorPath</key>
@@ -30,6 +39,11 @@ pub fn render_launchd_plist(binary_path: &Path, config_path: &Path, home: &Path)
 "#,
         binary_path.display(),
         config_path.display(),
+        home.display(),
+        home.display(),
+        home.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""),
         home.display(),
         home.display(),
         home.display()
@@ -50,6 +64,11 @@ mod tests {
         );
         assert!(rendered.contains("ai.openclaw.subspace-daemon"));
         assert!(rendered.contains("/usr/local/bin/subspace-daemon"));
+        assert!(rendered.contains("<key>HOME</key>"));
+        assert!(rendered.contains("<string>/Users/mike</string>"));
+        assert!(rendered.contains("<key>USER</key>"));
+        assert!(rendered.contains("<string>mike</string>"));
+        assert!(rendered.contains("/Users/mike/.local/bin:/opt/homebrew/bin"));
         assert!(!rendered.contains("\\\""));
     }
 }
