@@ -17,6 +17,7 @@ use crate::gateway::device_identity::GatewayDeviceIdentity;
 use crate::gateway::protocol::{
     AuthPayload, ConnectClient, ConnectParams, DeviceAuthPayload, EventFrame, GatewayError,
     HelloOk, PROTOCOL_VERSION, RequestFrame, ResponseFrame, build_device_auth_payload_v3,
+    describe_hello_payload,
 };
 use crate::retry::jitter;
 use crate::supervisor::DaemonStatus;
@@ -305,8 +306,14 @@ async fn connect_once(
         if let Ok(res) = serde_json::from_str::<ResponseFrame>(&text) {
             if res.frame_type == "res" && res.id == connect_id {
                 if res.ok {
-                    break serde_json::from_value::<HelloOk>(res.payload)
-                        .context("invalid hello-ok payload")?;
+                    break serde_json::from_value::<HelloOk>(res.payload.clone()).with_context(
+                        || {
+                            format!(
+                                "invalid hello-ok payload: {}",
+                                describe_hello_payload(&res.payload)
+                            )
+                        },
+                    )?;
                 }
                 let error = res.error.unwrap_or(GatewayError {
                     code: None,
@@ -348,12 +355,14 @@ async fn connect_once(
         }
     };
 
-    if let Some(auth) = hello.auth {
+    if let Some(auth) = hello.auth
+        && let Some(device_token) = auth.device_token
+    {
         device_auth_store::store_token(
             &config.paths.gateway_device_auth_store_path,
             &identity.device_id,
             &auth.role,
-            &auth.device_token,
+            &device_token,
             &auth.scopes,
         )?;
     }
