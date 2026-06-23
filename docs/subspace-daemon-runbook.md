@@ -235,6 +235,39 @@ Use the OpenClaw device approval path for the host. Expected after approval:
 
 - healthz gateway_state becomes live
 - daemon logs include gateway_live
+
+## Daily Argus News Pipeline Freshness Monitor
+
+T1394 adds a read-only operator monitor for the Racter Argus -> Subspace Swarm -> TARS daemon DB path. It is intentionally source/runbook only until Flynn explicitly approves cron activation or production config changes.
+
+Default command shape:
+
+```bash
+support/news_pipeline_freshness_monitor.py \
+  --argus-host racter \
+  --argus-db /var/lib/argus/argus.sqlite3 \
+  --daemon-host tars \
+  --daemon-db ~/.openclaw/subspace-daemon/data/daemon.sqlite3 \
+  --daemon-server-key https_subspace_swarm_channel_443
+```
+
+The monitor exits `0` only when the latest successful Argus `publish_attempts.subspace_message_id` is present as an `argus-racter-publisher` row for the expected TARS daemon ingress source inside the freshness window. The default daemon ingress source is `https_subspace_swarm_channel_443` and is configurable with `--daemon-server-key`. The default freshness window is 180 minutes and is configurable with `--freshness-minutes`; the producer window defaults to 1440 minutes and is configurable with `--producer-window-minutes`.
+
+Failure classes are deliberately separate:
+
+- `argus_not_publishing`: no recent successful Argus publish was found.
+- `swarm_to_daemon_stale`: Argus has a successful Subspace message id, but the TARS daemon DB has not accepted that message inside the freshness window.
+- `daemon_runtime_down`: the TARS daemon health socket cannot be read, `healthz.ok` is not true, the expected daemon server is not live, or the daemon DB read path cannot be read.
+
+On failure the script sends an operator-visible alert through `--alert-command`, defaulting to `~/.local/bin/notify --session agent:main:main --`. Alert/report output includes the check timestamp, latest Argus message id, latest daemon DB row id/message id, and root-cause class only; it does not print tokens, session credentials, or payload bodies.
+
+Cron activation path, after Flynn approval:
+
+```cron
+17 * * * * cd /Users/mike/src/subspace-daemon && support/news_pipeline_freshness_monitor.py --argus-host racter --daemon-host tars >> ~/.openclaw/subspace-daemon/logs/news-pipeline-monitor.log 2>&1
+```
+
+Hourly cron satisfies the at-least-daily requirement with margin. Do not install or edit the cron entry, restart daemons, mutate production config, or edit production DB as part of source preparation.
 - the daemon keeps retrying automatically while approval is pending
 
 ## 9. Optional launchd service install
