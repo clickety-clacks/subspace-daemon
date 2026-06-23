@@ -21,9 +21,9 @@ pub fn render_launchd_plist(binary_path: &Path, config_path: &Path, home: &Path)
         tmux_log_path.display()
     );
     let supervisor_cmd = format!(
-        "TMUX=/opt/homebrew/bin/tmux; SESSION=subspace-daemon-live; CMD=\"{}\"; START_GRACE=180; FAILS=0; LAST_START=0; start_session() {{ \"$TMUX\" new-session -d -s \"$SESSION\" \"$CMD\"; LAST_START=$(/bin/date +%s); FAILS=0; }}; while true; do NOW=$(/bin/date +%s); if ! \"$TMUX\" has-session -t \"$SESSION\" 2>/dev/null; then start_session; sleep 15; continue; fi; if /usr/bin/curl --max-time 10 --fail --unix-socket '{}' http://localhost/healthz >/dev/null 2>&1; then FAILS=0; elif [ $((NOW-LAST_START)) -lt \"$START_GRACE\" ]; then :; else FAILS=$((FAILS+1)); if [ \"$FAILS\" -ge 3 ]; then \"$TMUX\" kill-session -t \"$SESSION\" 2>/dev/null || true; start_session; fi; fi; sleep 30; done",
+        "TMUX=/opt/homebrew/bin/tmux; SESSION=subspace-daemon-live; ANCHOR=subspace-daemon-anchor; SOCKET='{}'; CMD=\"{}\"; START_GRACE=180; FAILS=0; LAST_START=0; ensure_anchor() {{ \"$TMUX\" has-session -t \"$ANCHOR\" 2>/dev/null || \"$TMUX\" new-session -d -s \"$ANCHOR\" 'sleep 3650d'; }}; start_session() {{ ensure_anchor; /bin/rm -f \"$SOCKET\"; \"$TMUX\" new-session -d -s \"$SESSION\" \"$CMD\"; LAST_START=$(/bin/date +%s); FAILS=0; }}; ensure_anchor; while true; do NOW=$(/bin/date +%s); if ! \"$TMUX\" has-session -t \"$SESSION\" 2>/dev/null; then start_session; sleep 15; continue; fi; if /usr/bin/curl --max-time 10 --fail --unix-socket \"$SOCKET\" http://localhost/healthz >/dev/null 2>&1; then FAILS=0; elif [ $((NOW-LAST_START)) -lt \"$START_GRACE\" ]; then :; else FAILS=$((FAILS+1)); if [ \"$FAILS\" -ge 3 ]; then \"$TMUX\" kill-session -t \"$SESSION\" 2>/dev/null || true; start_session; fi; fi; sleep 30; done",
+        socket_path.display(),
         daemon_cmd,
-        socket_path.display()
     );
 
     format!(
@@ -94,6 +94,8 @@ mod tests {
         assert!(rendered.contains("<string>/bin/zsh</string>"));
         assert!(rendered.contains("<string>-lc</string>"));
         assert!(rendered.contains("subspace-daemon-live"));
+        assert!(rendered.contains("subspace-daemon-anchor"));
+        assert!(rendered.contains("/bin/rm -f"));
         assert!(rendered.contains("/opt/homebrew/bin/tmux"));
         assert!(rendered.contains("/usr/local/bin/subspace-daemon"));
         assert!(rendered.contains("START_GRACE=180"));
