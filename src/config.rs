@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,7 @@ pub struct Config {
     pub retry: RetryConfig,
     pub storage: StorageConfig,
     pub sinks: Vec<SinkConfig>,
+    pub hard_failure_hooks: Vec<HardFailureHookConfig>,
     pub paths: AppPaths,
 }
 
@@ -91,6 +93,18 @@ pub struct SinkConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardFailureHookConfig {
+    pub key: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub template: String,
+    pub timeout_ms: u64,
+    pub throttle_ms: u64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkKind {
     Db,
     AgentSessionWake,
@@ -151,6 +165,8 @@ pub struct StoredConfig {
     pub storage: StoredStorageConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sinks: Option<Vec<StoredSinkConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_failure_hooks: Option<Vec<StoredHardFailureHookConfig>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -236,6 +252,21 @@ pub struct StoredSinkConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StoredHardFailureHookConfig {
+    pub key: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub template: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub throttle_ms: Option<u64>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StoredAttentionConfig {
     #[serde(default)]
     pub local_pack_paths: Vec<String>,
@@ -274,6 +305,7 @@ impl Default for StoredConfig {
             retry: StoredRetryConfig::default(),
             storage: StoredStorageConfig::default(),
             sinks: None,
+            hard_failure_hooks: None,
         }
     }
 }
@@ -425,9 +457,46 @@ impl Config {
                 auto_migrate: stored.storage.auto_migrate.unwrap_or(true),
             },
             sinks: normalize_sinks(stored.sinks.as_deref())?,
+            hard_failure_hooks: normalize_hard_failure_hooks(stored.hard_failure_hooks.as_deref())?,
             paths,
         })
     }
+}
+
+fn normalize_hard_failure_hooks(
+    stored: Option<&[StoredHardFailureHookConfig]>,
+) -> Result<Vec<HardFailureHookConfig>> {
+    let raw = stored.unwrap_or(&[]);
+    let mut seen = BTreeSet::new();
+    let mut hooks = Vec::with_capacity(raw.len());
+    for (index, hook) in raw.iter().cloned().enumerate() {
+        let key = hook
+            .key
+            .unwrap_or_else(|| format!("hook-{}", index + 1))
+            .trim()
+            .to_string();
+        if key.is_empty() {
+            bail!("hard_failure_hooks key must not be empty");
+        }
+        if !seen.insert(key.clone()) {
+            bail!("duplicate hard_failure_hooks key: {key}");
+        }
+        let command = hook.command.trim().to_string();
+        if command.is_empty() {
+            bail!("hard_failure_hooks command must not be empty");
+        }
+        hooks.push(HardFailureHookConfig {
+            key,
+            command,
+            args: hook.args,
+            env: hook.env,
+            template: hook.template.unwrap_or_else(|| "{{payload}}".to_string()),
+            timeout_ms: hook.timeout_ms.unwrap_or(10_000),
+            throttle_ms: hook.throttle_ms.unwrap_or(300_000),
+            enabled: hook.enabled.unwrap_or(true),
+        });
+    }
+    Ok(hooks)
 }
 
 fn normalize_sinks(stored: Option<&[StoredSinkConfig]>) -> Result<Vec<SinkConfig>> {
@@ -1083,6 +1152,45 @@ mod tests {
         assert!(!config.sinks[0].enabled);
         assert_eq!(config.sinks[1].key, "wake-primary");
         assert_eq!(config.sinks[1].kind, SinkKind::AgentSessionWake);
+    }
+
+    #[test]
+    fn loads_hard_failure_hooks() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+              "hard_failure_hooks": [
+                {
+                  "key": "ops",
+                  "command": "/usr/bin/env",
+                  "args": ["sh", "-c", "cat"],
+                  "env": { "HOOK_TARGET": "{{target}}" },
+                  "template": "{{payload}}",
+                  "timeout_ms": 2500,
+                  "throttle_ms": 10000
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(config_path).unwrap();
+        assert_eq!(config.hard_failure_hooks.len(), 1);
+        assert_eq!(config.hard_failure_hooks[0].key, "ops");
+        assert_eq!(config.hard_failure_hooks[0].command, "/usr/bin/env");
+        assert_eq!(config.hard_failure_hooks[0].args, ["sh", "-c", "cat"]);
+        assert_eq!(
+            config.hard_failure_hooks[0]
+                .env
+                .get("HOOK_TARGET")
+                .map(String::as_str),
+            Some("{{target}}")
+        );
+        assert_eq!(config.hard_failure_hooks[0].timeout_ms, 2500);
+        assert_eq!(config.hard_failure_hooks[0].throttle_ms, 10000);
+        assert!(config.hard_failure_hooks[0].enabled);
     }
 
     #[test]

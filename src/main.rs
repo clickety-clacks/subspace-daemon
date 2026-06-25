@@ -2,6 +2,7 @@ mod attention;
 mod build_info;
 mod config;
 mod gateway;
+mod hard_failure;
 mod ipc;
 mod launchd;
 mod logging;
