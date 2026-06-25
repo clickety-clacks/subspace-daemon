@@ -12,6 +12,7 @@ use crate::config::{
     Config, ReplayConfig, RetryConfig, ServerConfig, StoredConfig, canonicalize_base_url,
     default_config_path, default_registration_name, derive_app_paths, derive_server_key,
 };
+use crate::hard_failure::HardFailureHooks;
 use crate::subspace::auth::register_identity;
 use crate::subspace::client::{ServerHandle, start_server_manager};
 use crate::subspace::identity::{
@@ -53,6 +54,7 @@ pub struct LiveSetupState {
     pub retry: RetryConfig,
     pub replay: ReplayConfig,
     pub attention: AttentionConfig,
+    pub hard_failure_hooks: HardFailureHooks,
     pub shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -236,6 +238,7 @@ pub(crate) async fn spawn_server_manager(
         attention,
         runtime.status.clone(),
         runtime.wake_tx.clone(),
+        runtime.hard_failure_hooks.clone(),
         runtime.shutdown_tx.subscribe(),
     )
     .await?;
@@ -405,6 +408,7 @@ mod tests {
                 discard_before_ts: None,
             },
             attention: AttentionConfig::default(),
+            hard_failure_hooks: HardFailureHooks::new(Vec::new()),
             shutdown_tx,
         };
 

@@ -13,6 +13,7 @@ use crate::attention::{
 };
 use crate::config::{Config, RetryConfig, SinkConfig, SinkKind};
 use crate::gateway::client::{GatewayClientHandle, start_gateway_client};
+use crate::hard_failure::{HardFailureEvent, HardFailureHooks};
 use crate::ipc::{SendRouter, run_ipc_server};
 use crate::launchd::render_launchd_plist;
 use crate::retry::jitter;
@@ -309,21 +310,40 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
     }
 
     let status = Arc::new(RwLock::new(DaemonStatus::new(&config)));
+    let hard_failure_hooks = HardFailureHooks::new(config.hard_failure_hooks.clone());
     let delivery_store = if config
         .sinks
         .iter()
         .any(|sink| sink.enabled && sink.kind == SinkKind::Db)
     {
         let store = DeliveryStore::new(&config.storage);
-        store.ensure_ready()?;
+        if let Err(err) = store.ensure_ready() {
+            hard_failure_hooks
+                .fire(HardFailureEvent::new(
+                    "db_sink_ready_failed",
+                    "storage",
+                    Some(config.storage.database_path.display().to_string()),
+                    err.to_string(),
+                    serde_json::json!({
+                        "database_path": config.storage.database_path,
+                    }),
+                ))
+                .await;
+            return Err(err);
+        }
         Some(store)
     } else {
         None
     };
     let (shutdown_tx, _) = broadcast::channel(4);
 
-    let (gateway, gateway_task) =
-        start_gateway_client(config.clone(), status.clone(), shutdown_tx.subscribe()).await?;
+    let (gateway, gateway_task) = start_gateway_client(
+        config.clone(),
+        status.clone(),
+        hard_failure_hooks.clone(),
+        shutdown_tx.subscribe(),
+    )
+    .await?;
 
     let (wake_tx, wake_rx) = mpsc::channel(1000);
     let server_tasks: SharedServerTasks = Arc::new(Mutex::new(Vec::new()));
@@ -337,6 +357,7 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
         retry: config.retry.clone(),
         replay: config.replay.clone(),
         attention: config.attention.clone(),
+        hard_failure_hooks: hard_failure_hooks.clone(),
         shutdown_tx: shutdown_tx.clone(),
     };
     for server in config.servers.iter().filter(|server| server.enabled) {
@@ -356,6 +377,7 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
         config.retry.clone(),
         config.sinks.clone(),
         delivery_store,
+        hard_failure_hooks.clone(),
         shutdown_tx.subscribe(),
     ));
     let ipc_task = tokio::spawn(run_ipc_server(
@@ -395,20 +417,20 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
             result = &mut gateway_task => {
                 let _ = shutdown_tx.send(());
                 let _ = tokio::fs::remove_file(&config.paths.socket_path).await;
-                return handle_task_exit("gateway", result).await;
+                return handle_task_exit("gateway", result, &hard_failure_hooks).await;
             }
             result = &mut wake_task => {
                 let _ = shutdown_tx.send(());
                 let _ = tokio::fs::remove_file(&config.paths.socket_path).await;
-                return handle_task_exit("wake_queue", result).await;
+                return handle_task_exit("wake_queue", result, &hard_failure_hooks).await;
             }
             result = &mut ipc_task => {
                 let _ = shutdown_tx.send(());
                 let _ = tokio::fs::remove_file(&config.paths.socket_path).await;
-                return handle_task_exit("ipc", result).await;
+                return handle_task_exit("ipc", result, &hard_failure_hooks).await;
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if let Some(result) = check_server_exit(&server_tasks).await {
+                if let Some(result) = check_server_exit(&server_tasks, &hard_failure_hooks).await {
                     let _ = shutdown_tx.send(());
                     let _ = tokio::fs::remove_file(&config.paths.socket_path).await;
                     return result;
@@ -418,12 +440,22 @@ pub async fn run_supervisor(config: Config) -> Result<()> {
     }
 }
 
-async fn check_server_exit(server_tasks: &SharedServerTasks) -> Option<Result<()>> {
+async fn check_server_exit(
+    server_tasks: &SharedServerTasks,
+    hard_failure_hooks: &HardFailureHooks,
+) -> Option<Result<()>> {
     let mut tasks = server_tasks.lock().await;
     for (server_key, task) in tasks.iter_mut() {
         if task.is_finished() {
             let result = task.await;
-            return Some(handle_task_exit(&format!("subspace:{server_key}"), result).await);
+            return Some(
+                handle_task_exit(
+                    &format!("subspace:{server_key}"),
+                    result,
+                    hard_failure_hooks,
+                )
+                .await,
+            );
         }
     }
     None
@@ -432,18 +464,38 @@ async fn check_server_exit(server_tasks: &SharedServerTasks) -> Option<Result<()
 async fn handle_task_exit(
     task_name: &str,
     result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    hard_failure_hooks: &HardFailureHooks,
 ) -> Result<()> {
     match result {
-        Ok(Ok(())) => Err(anyhow!("{task_name} exited unexpectedly")),
+        Ok(Ok(())) => {
+            let err = anyhow!("{task_name} exited unexpectedly");
+            fire_task_exit_hook(task_name, &err, hard_failure_hooks).await;
+            Err(err)
+        }
         Ok(Err(err)) => {
             error!(component = "supervisor", event = "daemon_degraded", task = task_name, error = %err, "critical task failed");
+            fire_task_exit_hook(task_name, &err, hard_failure_hooks).await;
             Err(err)
         }
         Err(err) => {
             error!(component = "supervisor", event = "daemon_degraded", task = task_name, error = %err, "critical task panicked");
-            Err(anyhow!(err))
+            let err = anyhow!(err);
+            fire_task_exit_hook(task_name, &err, hard_failure_hooks).await;
+            Err(err)
         }
     }
+}
+
+async fn fire_task_exit_hook(task_name: &str, err: &anyhow::Error, hooks: &HardFailureHooks) {
+    hooks
+        .fire(HardFailureEvent::new(
+            "critical_task_exit",
+            "supervisor",
+            Some(task_name.to_string()),
+            err.to_string(),
+            serde_json::json!({ "task": task_name }),
+        ))
+        .await;
 }
 
 async fn process_wake_queue(
@@ -453,6 +505,7 @@ async fn process_wake_queue(
     retry: RetryConfig,
     sinks: Vec<SinkConfig>,
     delivery_store: Option<DeliveryStore>,
+    hard_failure_hooks: HardFailureHooks,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut shutting_down = false;
@@ -499,7 +552,16 @@ async fn process_wake_queue(
         }
 
         if let Some(store) = delivery_store.as_ref() {
-            store.record_attention_decision(&item, &attention_result)?;
+            if let Err(err) = store.record_attention_decision(&item, &attention_result) {
+                hard_failure_hooks
+                    .fire(storage_hard_failure_event(
+                        "db_attention_decision_failed",
+                        &item,
+                        &err,
+                    ))
+                    .await;
+                return Err(err);
+            }
         }
 
         if !attention_result.deliver {
@@ -582,6 +644,19 @@ async fn process_wake_queue(
                     .count(),
                 "message matched receptor policy but cannot be delivered because no sinks are configured"
             );
+            hard_failure_hooks
+                .fire(HardFailureEvent::new(
+                    "sink_delivery_blocked_no_sinks",
+                    "wake_router",
+                    Some(item.server.clone()),
+                    "message matched receptor policy but no sinks are configured",
+                    serde_json::json!({
+                        "server": item.server,
+                        "server_key": item.server_key,
+                        "message_id": item.message_id,
+                    }),
+                ))
+                .await;
             let mut runtime = item.runtime.lock().await;
             runtime.mark_processed(&item.message_id, &item.timestamp);
             runtime.flush()?;
@@ -589,7 +664,18 @@ async fn process_wake_queue(
         }
 
         if let Some(store) = delivery_store.as_ref() {
-            store.reconcile_sink_targets(&sinks, &wake_session_key)?;
+            if let Err(err) = store.reconcile_sink_targets(&sinks, &wake_session_key) {
+                hard_failure_hooks
+                    .fire(HardFailureEvent::new(
+                        "db_sink_target_reconcile_failed",
+                        "storage",
+                        None,
+                        err.to_string(),
+                        serde_json::json!({}),
+                    ))
+                    .await;
+                return Err(err);
+            }
         }
 
         let candidate_sinks = routing_entries_for_sinks(
@@ -630,7 +716,18 @@ async fn process_wake_queue(
 
         if let Some(sink) = db_sink {
             if let Some(store) = delivery_store.as_ref() {
-                store.record_db_sink_delivery(&item, &attention_result, sink, &routing)?;
+                if let Err(err) =
+                    store.record_db_sink_delivery(&item, &attention_result, sink, &routing)
+                {
+                    hard_failure_hooks
+                        .fire(storage_hard_failure_event(
+                            "db_sink_delivery_failed",
+                            &item,
+                            &err,
+                        ))
+                        .await;
+                    return Err(err);
+                }
             }
         }
 
@@ -651,12 +748,20 @@ async fn process_wake_queue(
                     })
                     .to_string(),
                 };
-                Some(store.queue_wake_sink_delivery(
-                    &item,
-                    &attention_result,
-                    &snapshot,
-                    &routing,
-                )?)
+                match store.queue_wake_sink_delivery(&item, &attention_result, &snapshot, &routing)
+                {
+                    Ok(ticket) => Some(ticket),
+                    Err(err) => {
+                        hard_failure_hooks
+                            .fire(storage_hard_failure_event(
+                                "db_wake_sink_queue_failed",
+                                &item,
+                                &err,
+                            ))
+                            .await;
+                        return Err(err);
+                    }
+                }
             } else {
                 None
             };
@@ -728,6 +833,20 @@ async fn process_wake_queue(
                             }
                         }
                         warn!(component = "wake_router", event = "wake_failed", message_id = %item.message_id, server = %item.server, sink_key = %sink.key, error = %err, "wake failed; retrying");
+                        hard_failure_hooks
+                            .fire(HardFailureEvent::new(
+                                "wake_delivery_failed",
+                                "wake_router",
+                                Some(format!("{}:{}", item.server, sink.key)),
+                                err.to_string(),
+                                serde_json::json!({
+                                    "server": item.server,
+                                    "server_key": item.server_key,
+                                    "message_id": item.message_id,
+                                    "sink_key": sink.key,
+                                }),
+                            ))
+                            .await;
                         let delay = Duration::from_millis(jitter(backoff_ms, retry.jitter_ratio));
                         if let Some(deadline) = shutdown_deadline {
                             let remaining =
@@ -749,6 +868,24 @@ async fn process_wake_queue(
         runtime.mark_processed(&item.message_id, &item.timestamp);
         runtime.flush()?;
     }
+}
+
+fn storage_hard_failure_event(
+    kind: &str,
+    item: &WakeEnvelope,
+    err: &anyhow::Error,
+) -> HardFailureEvent {
+    HardFailureEvent::new(
+        kind,
+        "storage",
+        Some(item.server.clone()),
+        err.to_string(),
+        serde_json::json!({
+            "server": item.server,
+            "server_key": item.server_key,
+            "message_id": item.message_id,
+        }),
+    )
 }
 
 fn routing_entries_for_sinks(

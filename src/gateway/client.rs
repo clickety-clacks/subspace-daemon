@@ -18,6 +18,7 @@ use crate::gateway::protocol::{
     AuthPayload, ConnectClient, ConnectParams, DeviceAuthPayload, EventFrame, GatewayError,
     HelloOk, PROTOCOL_VERSION, RequestFrame, ResponseFrame, build_device_auth_payload_v3,
 };
+use crate::hard_failure::{HardFailureEvent, HardFailureHooks};
 use crate::retry::jitter;
 use crate::supervisor::DaemonStatus;
 
@@ -74,6 +75,7 @@ struct SelectedConnectAuth {
 pub async fn start_gateway_client(
     config: Config,
     status: Arc<RwLock<DaemonStatus>>,
+    hard_failure_hooks: HardFailureHooks,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<(GatewayClientHandle, JoinHandle<Result<()>>)> {
     let identity = GatewayDeviceIdentity::load_or_create(
@@ -82,13 +84,21 @@ pub async fn start_gateway_client(
         config.gateway.device_id.as_deref(),
     )?;
     let (tx, rx) = mpsc::channel(128);
-    let task = tokio::spawn(run_gateway_task(config, status, identity, rx, shutdown));
+    let task = tokio::spawn(run_gateway_task(
+        config,
+        status,
+        hard_failure_hooks,
+        identity,
+        rx,
+        shutdown,
+    ));
     Ok((GatewayClientHandle { tx }, task))
 }
 
 async fn run_gateway_task(
     config: Config,
     status: Arc<RwLock<DaemonStatus>>,
+    hard_failure_hooks: HardFailureHooks,
     identity: GatewayDeviceIdentity,
     mut rx: mpsc::Receiver<GatewayCommand>,
     mut shutdown: broadcast::Receiver<()>,
@@ -136,6 +146,13 @@ async fn run_gateway_task(
                     reason = ?DisconnectReason::PairingRequired,
                     "gateway disconnected"
                 );
+                hard_failure_hooks
+                    .fire(gateway_hard_failure_event(
+                        &config,
+                        "gateway_pairing_required",
+                        "gateway pairing required",
+                    ))
+                    .await;
             }
             Ok(DisconnectReason::Transport) => {
                 backoff = config.retry.base_ms;
@@ -147,6 +164,13 @@ async fn run_gateway_task(
                     reason = ?DisconnectReason::Transport,
                     "gateway disconnected"
                 );
+                hard_failure_hooks
+                    .fire(gateway_hard_failure_event(
+                        &config,
+                        "gateway_transport_disconnected",
+                        "gateway transport disconnected",
+                    ))
+                    .await;
             }
             Err(err) => {
                 if reconnecting {
@@ -165,6 +189,17 @@ async fn run_gateway_task(
                         "gateway connect attempt failed"
                     );
                 }
+                hard_failure_hooks
+                    .fire(gateway_hard_failure_event(
+                        &config,
+                        if reconnecting {
+                            "gateway_reconnect_failed"
+                        } else {
+                            "gateway_connect_failed"
+                        },
+                        &err.to_string(),
+                    ))
+                    .await;
             }
         }
         tokio::select! {
@@ -176,6 +211,18 @@ async fn run_gateway_task(
         }
         backoff = (backoff.saturating_mul(2)).min(config.retry.max_ms);
     }
+}
+
+fn gateway_hard_failure_event(config: &Config, kind: &str, message: &str) -> HardFailureEvent {
+    HardFailureEvent::new(
+        kind,
+        "gateway",
+        Some(config.gateway.ws_url.clone()),
+        message,
+        json!({
+            "gateway_ws_url": config.gateway.ws_url,
+        }),
+    )
 }
 
 #[derive(Debug)]

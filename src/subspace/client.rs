@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::attention::{MessageEmbedding, OutboundEmbeddingRequest, compose_outbound_embeddings};
 use crate::config::{ReplayConfig, RetryConfig, ServerConfig};
+use crate::hard_failure::{HardFailureEvent, HardFailureHooks};
 use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
 use crate::subspace::auth::{reauth_identity, reauth_legacy_identity};
@@ -146,6 +147,7 @@ pub async fn start_server_manager(
     attention: Arc<crate::attention::AttentionLayer>,
     status: Arc<RwLock<DaemonStatus>>,
     wake_tx: mpsc::Sender<WakeEnvelope>,
+    hard_failure_hooks: HardFailureHooks,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<(ServerHandle, JoinHandle<Result<()>>)> {
     let (tx, rx) = mpsc::channel(128);
@@ -158,6 +160,7 @@ pub async fn start_server_manager(
         attention,
         status,
         wake_tx,
+        hard_failure_hooks,
         rx,
         shutdown,
     ));
@@ -176,6 +179,7 @@ async fn run_server_manager(
     attention: Arc<crate::attention::AttentionLayer>,
     status: Arc<RwLock<DaemonStatus>>,
     wake_tx: mpsc::Sender<WakeEnvelope>,
+    hard_failure_hooks: HardFailureHooks,
     mut cmd_rx: mpsc::Receiver<ServerCommand>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -236,6 +240,13 @@ async fn run_server_manager(
                     if record_reconnect_failure(&status, &server, &runtime, &retry, error_kind)
                         .await?
                     {
+                        hard_failure_hooks
+                            .fire(server_hard_failure_event(
+                                &server,
+                                "subspace_auth_failed",
+                                &err.to_string(),
+                            ))
+                            .await;
                         continue;
                     }
                     tokio::select! {
@@ -257,6 +268,7 @@ async fn run_server_manager(
             &mut session,
             &generated_embedding_clients,
             &attention,
+            &hard_failure_hooks,
             &mut cmd_rx,
             &wake_tx,
             &mut shutdown,
@@ -273,6 +285,13 @@ async fn run_server_manager(
                 let error_kind = reconnect_error_kind(&err);
                 warn!(component = "subspace", event = "daemon_degraded", server = %server.base_url, server_key = %server.server_key, error_kind = %error_kind, "subspace disconnected");
                 if record_reconnect_failure(&status, &server, &runtime, &retry, error_kind).await? {
+                    hard_failure_hooks
+                        .fire(server_hard_failure_event(
+                            &server,
+                            "subspace_reconnect_cooldown",
+                            &err.to_string(),
+                        ))
+                        .await;
                     continue;
                 }
                 tokio::select! {
@@ -283,6 +302,19 @@ async fn run_server_manager(
             }
         }
     }
+}
+
+fn server_hard_failure_event(server: &ServerConfig, kind: &str, message: &str) -> HardFailureEvent {
+    HardFailureEvent::new(
+        kind,
+        "subspace",
+        Some(server.base_url.clone()),
+        message,
+        json!({
+            "server": server.base_url,
+            "server_key": server.server_key,
+        }),
+    )
 }
 
 async fn connect_once(
@@ -296,6 +328,7 @@ async fn connect_once(
         crate::attention::embedding_plugin::EmbeddingPluginClient,
     >,
     attention: &Arc<crate::attention::AttentionLayer>,
+    hard_failure_hooks: &HardFailureHooks,
     cmd_rx: &mut mpsc::Receiver<ServerCommand>,
     wake_tx: &mpsc::Sender<WakeEnvelope>,
     shutdown: &mut broadcast::Receiver<()>,
@@ -541,6 +574,13 @@ async fn connect_once(
                                         session.clear_session_token();
                                         session.persist(&server.session_path)?;
                                     }
+                                    hard_failure_hooks
+                                        .fire(server_hard_failure_event(
+                                            server,
+                                            "subspace_post_message_failed",
+                                            error_value,
+                                        ))
+                                        .await;
                                     let _ = pending_send.reply.send(Err(anyhow!(error_value.to_string())));
                                 }
                             }
