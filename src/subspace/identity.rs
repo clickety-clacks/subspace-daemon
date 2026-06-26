@@ -39,6 +39,8 @@ struct LegacySessionFile {
     owner: String,
     name: String,
     session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -46,6 +48,8 @@ pub struct SubspaceSessionRecord {
     pub identity: String,
     pub agent_id: String,
     pub session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +57,7 @@ pub struct LegacySubspaceSessionRecord {
     pub agent_id: String,
     pub registration_name: String,
     pub session_token: Option<String>,
+    pub session_expires_at: Option<String>,
     signing_key: SigningKey,
 }
 
@@ -172,6 +177,7 @@ impl SubspaceSessionRecord {
             identity,
             agent_id,
             session_token: None,
+            session_expires_at: None,
         }
     }
 
@@ -190,10 +196,12 @@ impl SubspaceSessionRecord {
 
     pub fn clear_session_token(&mut self) {
         self.session_token = None;
+        self.session_expires_at = None;
     }
 
-    pub fn update_session_token(&mut self, token: String) {
+    pub fn update_session_token(&mut self, token: String, expires_at: Option<String>) {
         self.session_token = Some(token);
+        self.session_expires_at = expires_at;
     }
 }
 
@@ -205,10 +213,12 @@ impl LegacySubspaceSessionRecord {
 
     pub fn clear_session_token(&mut self) {
         self.session_token = None;
+        self.session_expires_at = None;
     }
 
-    pub fn update_session_token(&mut self, token: String) {
+    pub fn update_session_token(&mut self, token: String, expires_at: Option<String>) {
         self.session_token = Some(token);
+        self.session_expires_at = expires_at;
     }
 
     pub fn persist(&self, path: &Path) -> Result<()> {
@@ -220,6 +230,7 @@ impl LegacySubspaceSessionRecord {
             owner: DEFAULT_SUBSPACE_OWNER.to_string(),
             name: self.registration_name.clone(),
             session_token: self.session_token.clone(),
+            session_expires_at: self.session_expires_at.clone(),
         };
         write_json_atomic(path, &file)
     }
@@ -231,7 +242,7 @@ impl LegacySubspaceSessionRecord {
         identity.ensure_matches_agent_id(&self.agent_id)?;
         let mut session = SubspaceSessionRecord::new(identity.name.clone(), self.agent_id.clone());
         if let Some(token) = self.session_token.clone() {
-            session.update_session_token(token);
+            session.update_session_token(token, self.session_expires_at.clone());
         }
         Ok(session)
     }
@@ -256,6 +267,7 @@ pub fn load_session_record(path: &Path) -> Result<Option<LoadedSessionRecord>> {
             agent_id: parsed.public_key,
             registration_name: parsed.name,
             session_token: parsed.session_token,
+            session_expires_at: parsed.session_expires_at,
             signing_key,
         },
     )))
@@ -302,6 +314,7 @@ mod tests {
             owner: "openclaw".to_string(),
             name: "heimdal".to_string(),
             session_token: Some("token".to_string()),
+            session_expires_at: None,
         };
         fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
@@ -323,6 +336,7 @@ mod tests {
             agent_id: "agent".to_string(),
             registration_name: "heimdal".to_string(),
             session_token: Some("token".to_string()),
+            session_expires_at: Some("2099-01-01T00:00:00Z".to_string()),
             signing_key: SigningKey::generate(&mut OsRng),
         };
         legacy.persist(&path).unwrap();
@@ -333,6 +347,10 @@ mod tests {
             LoadedSessionRecord::Legacy(mut session) => {
                 assert_eq!(session.registration_name, "heimdal");
                 assert_eq!(session.session_token.as_deref(), Some("token"));
+                assert_eq!(
+                    session.session_expires_at.as_deref(),
+                    Some("2099-01-01T00:00:00Z")
+                );
                 session.clear_session_token();
                 session.persist(&path).unwrap();
             }
@@ -343,6 +361,7 @@ mod tests {
             LoadedSessionRecord::Current(_) => panic!("expected legacy session"),
             LoadedSessionRecord::Legacy(session) => {
                 assert_eq!(session.session_token, None);
+                assert_eq!(session.session_expires_at, None);
             }
         }
     }

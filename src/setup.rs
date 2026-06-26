@@ -138,7 +138,7 @@ pub async fn perform_setup(
             .ok_or_else(|| anyhow!("setup requires --identity for a new server"))?;
         let identity =
             NamedIdentityRecord::load_or_create(&paths.identities_dir, requested_identity)?;
-        let session_token = register_identity(
+        let session_auth = register_identity(
             &Client::builder().build()?,
             &base_url,
             &registration_name,
@@ -147,7 +147,7 @@ pub async fn perform_setup(
         .await?;
         let mut session =
             SubspaceSessionRecord::new(identity.name.clone(), identity.public_key.clone());
-        session.update_session_token(session_token);
+        session.update_session_token(session_auth.token, Some(session_auth.expires_at));
         session.persist(&session_path)?;
         (identity.name, identity.public_key)
     };
@@ -375,6 +375,7 @@ mod tests {
                     server: base_url.to_string(),
                     server_key: derive_server_key(base_url).unwrap(),
                     subspace_state: "live".to_string(),
+                    session_expires_at: None,
                     veto_enforcement_state: "not_configured".to_string(),
                     attention: AttentionHealth::not_configured(),
                     consecutive_failures: None,

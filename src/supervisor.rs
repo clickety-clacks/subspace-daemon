@@ -37,6 +37,7 @@ pub struct ServerHealth {
     pub server: String,
     pub server_key: String,
     pub subspace_state: String,
+    pub session_expires_at: Option<String>,
     pub veto_enforcement_state: String,
     pub attention: AttentionHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +70,7 @@ impl DaemonStatus {
                         server: server.base_url.clone(),
                         server_key: server.server_key.clone(),
                         subspace_state: "connecting".to_string(),
+                        session_expires_at: None,
                         veto_enforcement_state: "not_configured".to_string(),
                         attention: AttentionHealth::not_configured(),
                         consecutive_failures: None,
@@ -88,12 +90,14 @@ impl DaemonStatus {
 
     pub fn is_healthy(&self) -> bool {
         matches!(self.gateway_state.as_str(), "live" | "pairing_required")
-            && self.servers.values().all(|server| {
-                matches!(
-                    server.subspace_state.as_str(),
-                    "live" | "reconnecting" | "reconnect_cooldown" | "subspace_auth_required"
-                )
-            })
+            && self
+                .servers
+                .values()
+                .all(|server| match server.subspace_state.as_str() {
+                    "live" => !session_expires_soon(server.session_expires_at.as_deref()),
+                    "reconnecting" | "reconnect_cooldown" | "subspace_auth_required" => true,
+                    _ => false,
+                })
     }
 
     pub fn set_gateway_state(&mut self, value: impl Into<String>) {
@@ -111,12 +115,17 @@ impl DaemonStatus {
             .get(base_url)
             .map(|server| server.attention.clone())
             .unwrap_or_else(AttentionHealth::not_configured);
+        let session_expires_at = self
+            .servers
+            .get(base_url)
+            .and_then(|server| server.session_expires_at.clone());
         self.servers.insert(
             base_url.to_string(),
             ServerHealth {
                 server: base_url.to_string(),
                 server_key: server_key.to_string(),
                 subspace_state: value.into(),
+                session_expires_at,
                 veto_enforcement_state,
                 attention,
                 consecutive_failures: None,
@@ -146,12 +155,17 @@ impl DaemonStatus {
             .get(base_url)
             .map(|server| server.attention.clone())
             .unwrap_or_else(AttentionHealth::not_configured);
+        let session_expires_at = self
+            .servers
+            .get(base_url)
+            .and_then(|server| server.session_expires_at.clone());
         self.servers.insert(
             base_url.to_string(),
             ServerHealth {
                 server: base_url.to_string(),
                 server_key: server_key.to_string(),
                 subspace_state: "reconnect_cooldown".to_string(),
+                session_expires_at,
                 veto_enforcement_state,
                 attention,
                 consecutive_failures: Some(consecutive_failures),
@@ -181,6 +195,7 @@ impl DaemonStatus {
                 server: base_url.to_string(),
                 server_key: server_key.to_string(),
                 subspace_state: "connecting".to_string(),
+                session_expires_at: None,
                 veto_enforcement_state: state,
                 attention: AttentionHealth::not_configured(),
                 consecutive_failures: None,
@@ -210,6 +225,7 @@ impl DaemonStatus {
                 server: base_url.to_string(),
                 server_key: server_key.to_string(),
                 subspace_state: "connecting".to_string(),
+                session_expires_at: None,
                 veto_enforcement_state: attention.veto_enforcement_state().to_string(),
                 attention,
                 consecutive_failures: None,
@@ -226,9 +242,51 @@ impl DaemonStatus {
             .map(|server| server.subspace_state.clone())
     }
 
+    pub fn set_server_session_expires_at(
+        &mut self,
+        base_url: &str,
+        server_key: &str,
+        session_expires_at: Option<String>,
+    ) {
+        if let Some(server) = self.servers.get_mut(base_url) {
+            server.server_key = server_key.to_string();
+            server.session_expires_at = session_expires_at;
+            return;
+        }
+
+        self.servers.insert(
+            base_url.to_string(),
+            ServerHealth {
+                server: base_url.to_string(),
+                server_key: server_key.to_string(),
+                subspace_state: "connecting".to_string(),
+                session_expires_at,
+                veto_enforcement_state: "not_configured".to_string(),
+                attention: AttentionHealth::not_configured(),
+                consecutive_failures: None,
+                cooldown_ms: None,
+                next_attempt_at: None,
+                last_error_kind: None,
+            },
+        );
+    }
+
     pub fn servers_snapshot(&self) -> Vec<ServerHealth> {
         self.servers.values().cloned().collect()
     }
+}
+
+fn session_expires_soon(session_expires_at: Option<&str>) -> bool {
+    let Some(session_expires_at) = session_expires_at else {
+        return true;
+    };
+    let Ok(expires_at) = time::OffsetDateTime::parse(
+        session_expires_at,
+        &time::format_description::well_known::Rfc3339,
+    ) else {
+        return true;
+    };
+    expires_at - time::OffsetDateTime::now_utc() <= time::Duration::hours(24)
 }
 
 impl AttentionHealth {
@@ -974,6 +1032,7 @@ mod tests {
                     server: "https://subspace.example".to_string(),
                     server_key: "https_subspace_example_443".to_string(),
                     subspace_state: "reconnect_cooldown".to_string(),
+                    session_expires_at: Some("2099-04-17T12:05:00Z".to_string()),
                     veto_enforcement_state: "not_configured".to_string(),
                     attention: AttentionHealth::not_configured(),
                     consecutive_failures: Some(10),
@@ -985,6 +1044,31 @@ mod tests {
         };
 
         assert!(status.is_healthy());
+    }
+
+    #[test]
+    fn missing_session_expiry_is_unhealthy() {
+        let status = DaemonStatus {
+            gateway_state: "live".to_string(),
+            wake_session_key: "agent:target:main".to_string(),
+            servers: BTreeMap::from([(
+                "https://subspace.example".to_string(),
+                ServerHealth {
+                    server: "https://subspace.example".to_string(),
+                    server_key: "https_subspace_example_443".to_string(),
+                    subspace_state: "live".to_string(),
+                    session_expires_at: None,
+                    veto_enforcement_state: "not_configured".to_string(),
+                    attention: AttentionHealth::not_configured(),
+                    consecutive_failures: None,
+                    cooldown_ms: None,
+                    next_attempt_at: None,
+                    last_error_kind: None,
+                },
+            )]),
+        };
+
+        assert!(!status.is_healthy());
     }
 
     #[test]
