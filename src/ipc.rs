@@ -593,6 +593,7 @@ mod tests {
                     server: canonical.clone(),
                     server_key: "https_subspace_example_443".to_string(),
                     subspace_state: "reconnect_cooldown".to_string(),
+                    session_expires_at: Some("2099-04-17T12:05:00Z".to_string()),
                     veto_enforcement_state: "not_configured".to_string(),
                     attention: AttentionHealth::not_configured(),
                     consecutive_failures: Some(10),

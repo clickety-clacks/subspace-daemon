@@ -18,12 +18,14 @@ use crate::attention::{MessageEmbedding, OutboundEmbeddingRequest, compose_outbo
 use crate::config::{ReplayConfig, RetryConfig, ServerConfig};
 use crate::retry::jitter;
 use crate::runtime_store::RuntimeStore;
-use crate::subspace::auth::{reauth_identity, reauth_legacy_identity};
+use crate::subspace::auth::{SessionAuth, reauth_identity, reauth_legacy_identity};
 use crate::subspace::identity::{
     LegacySubspaceSessionRecord, LoadedSessionRecord, NamedIdentityRecord, SubspaceSessionRecord,
     load_session_record,
 };
 use crate::supervisor::{DaemonStatus, WakeEnvelope};
+
+const SESSION_REFRESHED_RECONNECTING: &str = "subspace session refreshed; reconnecting";
 
 #[derive(Debug, Clone)]
 pub struct OutboundSendResult {
@@ -103,6 +105,13 @@ impl ActiveSession {
         }
     }
 
+    fn session_expires_at(&self) -> Option<&str> {
+        match self {
+            Self::Current { session, .. } => session.session_expires_at.as_deref(),
+            Self::Legacy(session) => session.session_expires_at.as_deref(),
+        }
+    }
+
     fn clear_session_token(&mut self) {
         match self {
             Self::Current { session, .. } => session.clear_session_token(),
@@ -110,10 +119,14 @@ impl ActiveSession {
         }
     }
 
-    fn update_session_token(&mut self, token: String) {
+    fn update_session_token(&mut self, auth: SessionAuth) {
         match self {
-            Self::Current { session, .. } => session.update_session_token(token),
-            Self::Legacy(session) => session.update_session_token(token),
+            Self::Current { session, .. } => {
+                session.update_session_token(auth.token, Some(auth.expires_at))
+            }
+            Self::Legacy(session) => {
+                session.update_session_token(auth.token, Some(auth.expires_at))
+            }
         }
     }
 
@@ -124,7 +137,7 @@ impl ActiveSession {
         }
     }
 
-    async fn reauth(&self, client: &Client, base_url: &str) -> Result<String> {
+    async fn reauth(&self, client: &Client, base_url: &str) -> Result<SessionAuth> {
         match self {
             Self::Current { session, identity } => {
                 reauth_identity(client, base_url, session, identity).await
@@ -225,9 +238,15 @@ async fn run_server_manager(
             update_server_state(&status, &server, "authenticating").await;
             info!(component = "subspace", event = "subspace_connecting", server = %server.base_url, server_key = %server.server_key, phase = "auth", "authenticating to subspace");
             match session.reauth(&http, &server.base_url).await {
-                Ok(token) => {
-                    session.update_session_token(token);
+                Ok(auth) => {
+                    session.update_session_token(auth);
                     session.persist(&server.session_path)?;
+                    update_server_session_expires_at(
+                        &status,
+                        &server,
+                        session.session_expires_at(),
+                    )
+                    .await;
                 }
                 Err(err) => {
                     update_server_state(&status, &server, "subspace_auth_required").await;
@@ -266,6 +285,11 @@ async fn run_server_manager(
         {
             Ok(()) => return Ok(()),
             Err(err) => {
+                if err.to_string() == SESSION_REFRESHED_RECONNECTING {
+                    update_server_state(&status, &server, "reconnecting").await;
+                    backoff = retry.base_ms;
+                    continue;
+                }
                 if reached_live {
                     backoff = retry.base_ms;
                 }
@@ -370,6 +394,7 @@ async fn connect_once(
     }
 
     update_server_state(status, server, "live").await;
+    update_server_session_expires_at(status, server, session.session_expires_at()).await;
     *reached_live = true;
     {
         let mut runtime = runtime.lock().await;
@@ -388,6 +413,26 @@ async fn connect_once(
                 return Ok(());
             }
             _ = heartbeat.tick() => {
+                if session_expires_soon(session.session_expires_at()) {
+                    update_server_state(status, server, "authenticating").await;
+                    warn!(component = "subspace", event = "subspace_session_expires_soon", server = %server.base_url, server_key = %server.server_key, session_expires_at = session.session_expires_at().unwrap_or("unknown"), "subspace session expires soon; refreshing");
+                    match session.reauth(&Client::new(), &server.base_url).await {
+                        Ok(auth) => {
+                            session.update_session_token(auth);
+                            session.persist(&server.session_path)?;
+                            update_server_session_expires_at(status, server, session.session_expires_at()).await;
+                            warn!(component = "subspace", event = "subspace_session_refreshed", server = %server.base_url, server_key = %server.server_key, session_expires_at = session.session_expires_at().unwrap_or("unknown"), "subspace session refreshed; reconnecting with fresh token");
+                            fail_pending_sends(&mut pending, SESSION_REFRESHED_RECONNECTING);
+                            bail!(SESSION_REFRESHED_RECONNECTING);
+                        }
+                        Err(err) => {
+                            update_server_state(status, server, "subspace_auth_required").await;
+                            warn!(component = "subspace", event = "daemon_degraded", server = %server.base_url, server_key = %server.server_key, error_kind = "auth_failed", error = %err, "subspace session refresh failed");
+                            fail_pending_sends(&mut pending, "subspace session refresh failed");
+                            bail!("subspace session refresh failed: {err}");
+                        }
+                    }
+                }
                 write.send(Message::Text(
                     serde_json::to_string(&json!({
                         "topic": "phoenix",
@@ -554,6 +599,12 @@ async fn connect_once(
     }
 }
 
+fn fail_pending_sends(pending: &mut HashMap<String, PendingSend>, message: &str) {
+    for (_, pending_send) in pending.drain() {
+        let _ = pending_send.reply.send(Err(anyhow!(message.to_string())));
+    }
+}
+
 async fn update_server_state(
     status: &Arc<RwLock<DaemonStatus>>,
     server: &ServerConfig,
@@ -563,6 +614,18 @@ async fn update_server_state(
         .write()
         .await
         .set_server_state(&server.base_url, &server.server_key, value.to_string());
+}
+
+async fn update_server_session_expires_at(
+    status: &Arc<RwLock<DaemonStatus>>,
+    server: &ServerConfig,
+    session_expires_at: Option<&str>,
+) {
+    status.write().await.set_server_session_expires_at(
+        &server.base_url,
+        &server.server_key,
+        session_expires_at.map(ToOwned::to_owned),
+    );
 }
 
 async fn update_server_reconnect_cooldown(
@@ -650,6 +713,16 @@ async fn record_reconnect_failure(
 
 fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+}
+
+fn session_expires_soon(session_expires_at: Option<&str>) -> bool {
+    let Some(session_expires_at) = session_expires_at else {
+        return true;
+    };
+    let Some(expires_at) = parse_rfc3339(session_expires_at) else {
+        return true;
+    };
+    expires_at - OffsetDateTime::now_utc() <= time::Duration::hours(24)
 }
 
 fn reconnect_error_kind(err: &anyhow::Error) -> String {
